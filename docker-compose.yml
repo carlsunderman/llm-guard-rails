@@ -1,0 +1,43 @@
+services:
+  guardrails:
+    build:
+      context: ./guardrails_service
+      dockerfile: Dockerfile
+    container_name: agent-guardrails
+    ports:
+      - "8090:8090"
+    environment:
+      - HOST=0.0.0.0
+      - PORT=8090
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8090/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 300s
+  proxy:
+    build:
+      context: ./proxy
+      dockerfile: Dockerfile
+    container_name: agent-guardrails-proxy
+    ports:
+      - "8000:8000"
+    environment:
+      - HOST=0.0.0.0
+      - PORT=8000
+      - GUARDRAILS_URL=http://guardrails:8090
+      - UPSTREAM_API_BASE=${UPSTREAM_API_BASE:-https://api.openai.com/v1}
+      - UPSTREAM_API_KEY=${UPSTREAM_API_KEY:-}
+      - UPSTREAM_MODEL=${UPSTREAM_MODEL:-gpt-4o}
+      - FAIL_CLOSED=${FAIL_CLOSED:-true}
+      - GUARDRAILS_TIMEOUT_SECONDS=${GUARDRAILS_TIMEOUT_SECONDS:-3}
+    restart: unless-stopped
+    depends_on:
+      guardrails:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 15s
+      timeout: 5s
+      retries: 3

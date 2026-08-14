@@ -1,0 +1,3 @@
+advisors:
+  - name: default
+    model: minimax-code/MiniMax-M3:high
