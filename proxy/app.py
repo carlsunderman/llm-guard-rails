@@ -19,11 +19,11 @@ import os
 import sys
 import time
 import uuid
-from typing import Any, Dict, List, Optional, Union
+from typing import Any, Dict, List, Optional
 
 import httpx
 from fastapi import FastAPI, HTTPException, Request
-from pydantic import BaseModel
+from pydantic import BaseModel, ValidationError
 
 app = FastAPI(title="LLM Guardrail Proxy", version="0.1.0")
 
@@ -50,18 +50,18 @@ logging.basicConfig(
 logger = logging.getLogger("guardrail-proxy")
 
 
-class ChatMessage(BaseModel):
-    role: str
-    # OpenAI allows a string, a list of typed content parts, or null
-    # (assistant messages carrying tool_calls commonly use null).
-    content: Optional[Union[str, List[Dict[str, Any]]]] = None
-
-
 class ChatCompletionRequest(BaseModel):
+    """Validation model — only the fields the proxy depends on are declared.
+
+    The raw request body is what gets forwarded upstream, so arbitrary
+    OpenAI parameters (tools, tool_choice, stream, response_format, top_p,
+    ...) pass through untouched instead of being dropped by pydantic.
+    """
+
     model: Optional[str] = None
-    messages: List[ChatMessage]
-    temperature: Optional[float] = 1.0
-    max_tokens: Optional[int] = None
+    # OpenAI allows message content as a string, a list of typed parts, or
+    # null (assistant messages carrying tool_calls commonly use null).
+    messages: List[Dict[str, Any]]
     agent_id: Optional[str] = None
     user_id: Optional[str] = None
 
@@ -124,7 +124,7 @@ def message_text(content: Any) -> str:
     return ""
 
 
-def extract_input_text(messages: List[ChatMessage]) -> str:
+def extract_input_text(messages: List[Dict[str, Any]]) -> str:
     """Extract the text to input-scan from the message list.
 
     Scans system, user, and tool messages; assistant turns are covered by
@@ -132,9 +132,9 @@ def extract_input_text(messages: List[ChatMessage]) -> str:
     """
     parts = []
     for m in messages:
-        if m.role == "assistant":
+        if m.get("role") == "assistant":
             continue
-        text = message_text(m.content)
+        text = message_text(m.get("content"))
         if text.strip():
             parts.append(text)
     return "\n".join(parts)
@@ -150,8 +150,18 @@ def extract_model_response(response_data: Dict[str, Any]) -> str:
 
 
 @app.post("/v1/chat/completions")
-async def chat_completions(req: ChatCompletionRequest):
+async def chat_completions(request: Request):
     """OpenAI-compatible chat completions endpoint with guardrail enforcement."""
+    try:
+        raw = await request.json()
+    except Exception:
+        raise HTTPException(status_code=400, detail="Request body must be valid JSON")
+
+    try:
+        req = ChatCompletionRequest(**raw)
+    except ValidationError:
+        raise HTTPException(status_code=422, detail="Invalid request: 'messages' must be a list")
+
     request_id = str(uuid.uuid4())
     start_time = time.time()
 
@@ -202,7 +212,12 @@ async def chat_completions(req: ChatCompletionRequest):
             detail=f"Request blocked by guardrails. Issues: {input_issues}",
         )
 
-    # Step 2: Forward to upstream LLM provider
+    # Step 2: Forward to upstream LLM provider.
+    # Forward the raw body verbatim (minus proxy-only fields) so no OpenAI
+    # parameters (tools, tool_choice, stream, response_format, ...) are lost.
+    upstream_body = {k: v for k, v in raw.items() if k not in ("agent_id", "user_id")}
+    upstream_body["model"] = model
+
     try:
         async with httpx.AsyncClient(timeout=120) as client:
             upstream_resp = await client.post(
@@ -211,12 +226,7 @@ async def chat_completions(req: ChatCompletionRequest):
                     "Authorization": f"Bearer {UPSTREAM_API_KEY}",
                     "Content-Type": "application/json",
                 },
-                json={
-                    "model": model,
-                    "messages": [{"role": m.role, "content": m.content} for m in req.messages],
-                    "temperature": req.temperature,
-                    **({"max_tokens": req.max_tokens} if req.max_tokens else {}),
-                },
+                json=upstream_body,
             )
             upstream_resp.raise_for_status()
             response_data = upstream_resp.json()
