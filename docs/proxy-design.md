@@ -126,6 +126,16 @@ Rationale:
 - Indirect prompt injection in agent workloads arrives via tool results and fetched context (tool and system messages), not only user text.
 - Assistant turns are covered by the output check on the final response; input-scanning them would double-scan model output and add false-positive surface.
 
+### 6. Scanner behaviour (notes)
+
+Investigated 2026-08-15 (review doc, item 7). No code change.
+
+- The `PromptInjection` scanner runs `protectai/deberta-v3-base-prompt-injection-v2`.
+- Its score is **bimodal and saturated**: ~1.0 for any text it flags, ~0.0-0.05 otherwise. There is no usable probability band, so threshold tuning cannot trade precision for recall (and vice versa).
+- It treats **verbatim-repetition / "echo this string" requests as injection** (e.g. `REPEAT: ...`, `Please echo this exact string: ...`). This is deliberate in the model, not a bug: asking a model to replay sensitive context verbatim is a known exfiltration / indirect-injection payload. Do not paper over it with a length-based skip or a pattern exception — that re-opens a real attack surface.
+- A lone SSN-shaped reference in normal prose (`Reference number 123-45-6789`) passes at ~0.01; it is the *repetition request* combined with the sensitive data that trips it.
+- Future mitigation options if this becomes operationally noisy: per-policy severity rules (see above) or substituting a different injection scanner. Recorded in `docs/review-2026-08-14.md`.
+
 ## Deployment
 
 POC (local):
