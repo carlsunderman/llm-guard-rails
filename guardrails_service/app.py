@@ -70,6 +70,8 @@ CREDENTIAL_PATTERNS: List[tuple] = [
     ("aws_temp_access_key_id", r"\bASIA[0-9A-Z]{16}\b"),
     ("github_token", r"\bgh[opsur]_[A-Za-z0-9]{36,}\b"),
     ("github_fine_grained_token", r"\bgithub_pat_[A-Za-z0-9_]{22,}\b"),
+    # Databricks personal access token (dapi + 44 alphanumerics)
+    ("databricks_pat", r"\bdapi[a-zA-Z0-9]{44}\b"),
     ("jwt", r"\beyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}"),
     ("pem_private_key", r"-----BEGIN [A-Z0-9 ]*PRIVATE KEY(?: BLOCK)?-----"),
     # scheme://user:pass@ — any URL with embedded basic-auth credentials
@@ -109,9 +111,13 @@ def _is_placeholder(value: str) -> bool:
 
 
 def _load_canary_tokens() -> List[str]:
-    """Exact-match canary tokens from CANARY_TOKENS (comma-separated env)."""
+    """Exact-match canary tokens from CANARY_TOKENS (comma-separated env).
+
+    Change canaries by editing CANARY_TOKENS (e.g. in .env) and restarting
+    the service.
+    """
     raw = os.getenv("CANARY_TOKENS", "")
-    return [t.strip() for t in raw.split(",") if t.strip()]
+    return [tok.strip() for tok in raw.split(",") if tok.strip()]
 
 
 def run_credential_scanners(text: str) -> List[Issue]:

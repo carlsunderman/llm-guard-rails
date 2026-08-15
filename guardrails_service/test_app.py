@@ -124,6 +124,16 @@ def test_check_input(text: str, expected_ok: bool, scanner_name: str | None):
             False,
             "credentials",
         ),
+        (
+            "Found token dapia1B2c3D4e5F6g7H8i9J0a1B2c3D4e5F6g7H8i9J0kLmN in the env dump.",
+            False,
+            "credentials",
+        ),
+        (
+            "jdbc:databricks://adb-123.cloud.databricks.com?httpPath=/sql/1.0/warehouses/x&accessToken=dapia1B2c3D4e5F6g7H8i9J0a1B2c3D4e5F6g7H8i9J0kLmN",
+            False,
+            "credentials",
+        ),
         # Placeholders and env indirection must not block
         (
             'Configure password="${DB_PASSWORD}" in the env file.',
