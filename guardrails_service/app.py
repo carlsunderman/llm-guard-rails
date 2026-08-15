@@ -4,7 +4,7 @@ Guardrail service for coding agents.
 Uses LLM Guard (v0.3.16) to scan prompts and responses for:
 - Prompt injection attempts (input)
 - Toxicity in prompts (input)
-- Sensitive/PII-like patterns in outputs via regex (output)
+- Sensitive patterns (secrets, SSN, credit cards) in outputs via regex (output)
 
 Run via Docker Compose; exposes HTTP endpoints on port 8090.
 """
@@ -26,27 +26,35 @@ app = FastAPI(title="Agent Guardrails", version="0.1.0")
 prompt_injection_scanner = PromptInjection(threshold=0.85)
 toxicity_scanner = InputToxicity(threshold=0.6)
 
-# Output scanner: regex-based detection of common PII/secrets patterns
-# Covers emails, phone numbers, US SSNs, credit cards, IPs, and generic API keys/tokens.
-pii_like_patterns = [
-    # Email
-    r"[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}",
+# Output scanner: regex-based detection of high-confidence secrets and strong PII.
+# Deliberately excludes low-confidence patterns (emails, IPs, phone numbers):
+# coding agents routinely emit 127.0.0.1, example.com addresses, and
+# phone-shaped test fixtures, which would false-positive as hard blocks.
+blocking_pii_patterns = [
     # US SSN (xxx-xx-xxxx)
     r"\b\d{3}-\d{2}-\d{4}\b",
     # Credit-card-like: 13-16 digits in groups of 4 with required separators
     # (avoids matching long contiguous numeric ids like transaction numbers)
     r"\b\d{4}[ -]\d{4}[ -]\d{4}[ -]?\d{1,4}\b",
-    # IPv4 addresses
-    r"\b(?:\d{1,3}\.){3}\d{1,3}\b",
-    # US phone numbers (various formats)
-    r"\b(?:\+?1[-.\s]?)?\(?\d{3}\)?[-.\s]?\d{3}[-.\s]?\d{4}\b",
-    # Generic API key / token patterns (e.g. sk-..., pk-..., ghp_...)
-    r"\b(?:sk|pk|rk)_[a-zA-Z0-9]{20,}\b",
+    # Generic API key / token patterns (e.g. sk-..., pk_..., ghp_...)
+    r"\b(?:sk|pk|rk)[- _][a-zA-Z0-9]{20,}\b",
     r"\bghp_[a-zA-Z0-9]{36,}\b",
     r"\bgp_[a-zA-Z0-9]{22,}\b",
 ]
 
-sensitive_pattern_scanner = OutputRegex(patterns=pii_like_patterns, is_blocked=True, redact=False)
+# Low-confidence PII patterns: NOT blocking. Reserved for the future
+# redact-only mode (see docs/proxy-design.md) so they can redact instead of
+# failing the request.
+redact_candidate_patterns = [
+    # Email
+    r"[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}",
+    # IPv4 addresses
+    r"\b(?:\d{1,3}\.){3}\d{1,3}\b",
+    # US phone numbers (various formats)
+    r"\b(?:\+?1[-.\s]?)?\(?\d{3}\)?[-.\s]?\d{3}[-.\s]?\d{4}\b",
+]
+
+sensitive_pattern_scanner = OutputRegex(patterns=blocking_pii_patterns, is_blocked=True, redact=False)
 
 
 class CheckRequest(BaseModel):

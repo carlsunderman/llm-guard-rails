@@ -3,7 +3,7 @@
 Local guardrail service and proxy using LLM Guard to scan prompts and responses for:
 - Prompt injection / jailbreak attempts (input)
 - Toxicity in prompts (input)
-- Sensitive/PII-like patterns in outputs (output, regex-based)
+- Sensitive patterns in outputs: API keys/tokens, SSNs, credit cards (output, regex-based; low-confidence PII like emails/IPs/phones is intentionally not blocking)
 
 Designed to protect coding agents (Pi/OMP, Claude Code, Codex, etc.) via a centralized enforcement layer.
 

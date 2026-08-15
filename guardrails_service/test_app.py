@@ -55,7 +55,20 @@ def test_check_input(text: str, expected_ok: bool, scanner_name: str | None):
             "sensitive_patterns",
         ),
         (
+            "SSN 123-45-6789 was echoed in the output.",
+            False,
+            "sensitive_patterns",
+        ),
+        (
             "Transaction id 12345678901234 and build 987654321098765 are recorded.",
+            True,
+            None,
+        ),
+        # Low-confidence PII must not block coding-agent output (reserved for
+        # the future redact-only mode).
+        (
+            "Server is listening on 127.0.0.1, contact ops@example.com, "
+            "phone +1 (555) 123-4567.",
             True,
             None,
         ),

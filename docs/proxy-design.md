@@ -17,6 +17,7 @@ Components:
 - Guardrail Proxy (`proxy/`)
   - HTTP server that accepts standard LLM-style requests (OpenAI-compatible chat completions for now).
   - Accepts OpenAI message content as a string, a list of typed parts, or null; content is forwarded to upstream verbatim.
+  - Arbitrary OpenAI parameters (tools, tool_choice, stream, response_format, top_p, ...) are forwarded to upstream verbatim; only the proxy-only `agent_id`/`user_id` fields are stripped before forwarding.
   - For each request:
     1. Extracts the input text (system, user, and tool messages) and metadata.
     2. Calls guardrail service /check-input.
@@ -149,7 +150,8 @@ Org-wide (future):
 
 ## Known issues (from 2026-08-14 review, see `docs/review-2026-08-14.md`)
 
-- **[P0]** The proxy silently strips undeclared OpenAI request fields (`tools`, `tool_choice`, `stream`, `response_format`, etc.) when forwarding upstream — agents relying on tool calling will break. Needs raw-body pass-through.
-- **[P1]** The output block list includes email/phone/IPv4 patterns that coding-agent output routinely contains; expect false-positive blocks until trimmed to high-confidence secrets.
+- **[P0, resolved 31a8186]** The proxy now forwards the raw request body verbatim (minus `agent_id`/`user_id`), so `tools`, `tool_choice`, `stream`, `response_format`, etc. reach upstream untouched. Covered by `proxy/test_app.py`.
+- **[P1, resolved]** The output block list is now high-confidence only (SSN, grouped credit cards, API-key/token shapes). Email/phone/IPv4 moved to `redact_candidate_patterns` (non-blocking, reserved for the future redact-only mode).
 - **[P1]** The proxy has no test coverage.
+- **[P1]** Remaining proxy test coverage: output-block path, fail-closed 503, fail-open passthrough, full allow-path passthrough (field-forwarding and input-block tests already exist in `proxy/test_app.py`).
 - **[P3]** `extract_input_text` scans every non-assistant role (whitelist to system/user/tool per design); `upstream_provider` audit field is hardcoded to "openai"; upstream timeout hardcoded at 120 s.
