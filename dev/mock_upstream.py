@@ -23,8 +23,12 @@ class Handler(BaseHTTPRequestHandler):
             # Benign prompt that makes the "model" emit PII (exercises the
             # output-block path without tripping the input injection scanner).
             content = "The SSN on file is 123-45-6789."
-        elif "REPEAT:" in last:
-            content = last.split("REPEAT:", 1)[1].strip()
+        elif "REPEAT:" in last or "MIRROR:" in last:
+            # MIRROR: exists because "REPEAT: ..." itself scores as prompt
+            # injection (imperative word + colon), which blocks the request
+            # before the echo can happen.
+            marker = "REPEAT:" if "REPEAT:" in last else "MIRROR:"
+            content = last.split(marker, 1)[1].strip()
         else:
             content = "Hello from mock upstream."
         resp = {
