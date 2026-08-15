@@ -146,7 +146,7 @@ Org-wide (future):
 - Input scanning covers system, user, and tool messages (assistant turns are covered by the output check); message content accepts string, list of parts, or null per the OpenAI schema.
 - Credit-card output pattern requires grouped 4-digit separators so long contiguous numeric ids (transaction numbers, build ids) no longer trigger false-positive blocks.
 - Proxy fails fast at startup if UPSTREAM_API_KEY is unset; upstream/guardrail error details are logged to stderr, never returned to clients.
-- Verified locally: prompt injection blocked at input (including system-role-only requests); benign prompt passed the input check and proceeded to the upstream call (which requires UPSTREAM_API_KEY to succeed); audit log entries written for both cases.
+- Verified end-to-end (2026-08-15, against a local OpenAI-compatible mock upstream): benign prompt returned the upstream response (200); model output containing an SSN blocked post-upstream (400, sensitive_patterns); injection prompt blocked pre-upstream (400, prompt_injection). Pure-JSON audit lines written for all three paths with the derived `upstream_provider`.
 - Not yet implemented: redaction, Anthropic-format route, tenant/user policy scoping, auth on the proxy, Kubernetes manifests.
 
 ## Known issues (from 2026-08-14 review, see `docs/review-2026-08-14.md`)
