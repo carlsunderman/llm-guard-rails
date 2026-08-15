@@ -3,10 +3,15 @@ Guardrail service for coding agents.
 
 Uses LLM Guard (v0.3.16) to scan prompts and responses for:
 - Prompt injection attempts (input)
-- Toxicity in prompts (input)
+- Toxicity in prompts (input; logged only by default — see SCANNER_POLICY)
 - Sensitive patterns (secrets, SSN, credit cards) in outputs via regex (output)
 - Credential leaks (API keys, connection strings with embedded passwords,
   private keys, password assignments, canary tokens) in inputs and outputs
+- Low-confidence PII (emails, IPv4, phone numbers) in inputs and outputs —
+  redacted to [REDACTED] in the `redacted` response field, never blocking
+
+Each scanner maps to an enforcement action via SCANNER_POLICY:
+block (fail the request), redact (mask + pass), or allow (log + pass).
 
 Run via Docker Compose; exposes HTTP endpoints on port 8090.
 """
@@ -45,9 +50,10 @@ blocking_pii_patterns = [
     r"\bgp_[a-zA-Z0-9]{22,}\b",
 ]
 
-# Low-confidence PII patterns: NOT blocking. Reserved for the future
-# redact-only mode (see docs/proxy-design.md) so they can redact instead of
-# failing the request.
+# Low-confidence PII patterns: never blocking. Redacted to [REDACTED] by
+# pii_redaction_scanner below (see SCANNER_POLICY). Coding agents routinely
+# emit 127.0.0.1, example.com addresses, and phone-shaped test fixtures,
+# which would false-positive as hard blocks.
 redact_candidate_patterns = [
     # Email
     r"[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}",
@@ -58,6 +64,38 @@ redact_candidate_patterns = [
 ]
 
 sensitive_pattern_scanner = OutputRegex(patterns=blocking_pii_patterns, is_blocked=True, redact=False)
+
+# Redact-mode scanners for low-confidence PII. is_blocked=True is required
+# for the LLM Guard regex scanner to perform the substitution; with
+# redact=True scan() returns (redacted_text, False, 1.0) on a match, where
+# redacted_text has hits replaced with [REDACTED]. One scanner per pattern
+# is needed because the 0.3.16 scanner returns after the FIRST matching
+# pattern, so a multi-pattern list would only ever redact one kind. They are
+# chained in run_pii_redaction. The "pii" policy action is "redact", so
+# matches never fail the request (see SCANNER_POLICY).
+pii_redaction_scanners = [
+    OutputRegex(patterns=[pattern], is_blocked=True, redact=True)
+    for pattern in redact_candidate_patterns
+]
+
+# Per-scanner enforcement action (the policy knob; externalizing this to a
+# YAML policy file is still pending, see docs/enhancements.md).
+#   block  -> an issue fails the request (400 at the proxy)
+#   redact -> matches are masked in the `redacted` response field; pass
+#   allow  -> logged to the audit trail only; pass
+# Change a value here and restart the service to flip behavior.
+ScannerAction = Literal["block", "redact", "allow"]
+SCANNER_POLICY: dict = {
+    "prompt_injection": "block",
+    # Logged only by default: DeBERTa-style toxicity scoring false-positives
+    # on aggressive (but benign) agent prompts. Set to "block" to restore
+    # hard-blocking behavior.
+    "toxicity": "allow",
+    "credentials": "block",
+    "canary_token": "block",
+    "sensitive_patterns": "block",
+    "pii": "redact",
+}
 
 # Credential-leak scanner (regex, no ML). Runs on BOTH inputs and outputs:
 # input hits stop credentials from ever entering model context, output hits
@@ -101,6 +139,8 @@ class Issue(BaseModel):
     scanner: str
     severity: Literal["low", "medium", "high", "critical"]
     message: str
+    # Enforcement action applied to this issue, from SCANNER_POLICY.
+    action: ScannerAction = "block"
 
 
 def _is_placeholder(value: str) -> bool:
@@ -136,6 +176,7 @@ def run_credential_scanners(text: str) -> List[Issue]:
                     scanner="credentials",
                     severity="high",
                     message=f"Possible credential leak ({name})",
+                    action=SCANNER_POLICY["credentials"],
                 )
             )
     for token in _load_canary_tokens():
@@ -145,6 +186,7 @@ def run_credential_scanners(text: str) -> List[Issue]:
                     scanner="canary_token",
                     severity="critical",
                     message="Canary token detected",
+                    action=SCANNER_POLICY["canary_token"],
                 )
             )
             break
@@ -152,14 +194,59 @@ def run_credential_scanners(text: str) -> List[Issue]:
 
 
 class CheckRequest(BaseModel):
-    text: str
+    # Either `text` (single blob, back-compat) or `segments` (per-message /
+    # per-part list; scanners run on the newline-joined text, redaction runs
+    # per segment so the caller can substitute each one back in place).
+    text: str = ""
+    segments: Optional[List[str]] = None
     agent_id: Optional[str] = None
     user_id: Optional[str] = None
 
 
 class CheckResponse(BaseModel):
+    # ok == no issue with a "block" policy action. Redact-action issues do
+    # not affect ok; their masked text comes back in `redacted`.
     ok: bool
     issues: List[Issue] = []
+    # Parallel to the effective segments (single element for text-only
+    # requests). None when nothing was redacted.
+    redacted: Optional[List[str]] = None
+
+
+def _effective_segments(req: CheckRequest) -> List[str]:
+    return req.segments if req.segments is not None else [req.text]
+
+
+def run_pii_redaction(segments: List[str]) -> tuple:
+    """Run the redact-mode PII scanner per segment.
+
+    The redact patterns never span newlines, so per-segment redaction is
+    equivalent to redacting the joined text. Returns
+    (redacted_segments_or_None, issues): the list is parallel to `segments`
+    and None when no segment changed.
+    """
+    redacted: List[str] = []
+    hits = 0
+    for segment in segments:
+        # Chain the per-pattern scanners; each either leaves the text
+        # unchanged or replaces its hits with [REDACTED].
+        text = segment
+        for scanner in pii_redaction_scanners:
+            text, _, _ = scanner.scan("", text)
+        if text != segment:
+            hits += 1
+        redacted.append(text)
+    issues: List[Issue] = []
+    if hits:
+        issues.append(
+            Issue(
+                scanner="pii",
+                severity="low",
+                message=f"Low-confidence PII (email/IP/phone) found in {hits} segment(s); redacted",
+                action=SCANNER_POLICY["pii"],
+            )
+        )
+    return (redacted if hits else None), issues
 
 
 def run_input_scanners(text: str) -> List[Issue]:
@@ -175,10 +262,11 @@ def run_input_scanners(text: str) -> List[Issue]:
                 scanner="prompt_injection",
                 severity=severity,
                 message=f"Possible prompt injection detected (score={score:.2f})",
+                action=SCANNER_POLICY["prompt_injection"],
             )
         )
 
-    # Toxicity in input
+    # Toxicity in input (allow-action by default: logged, not blocking)
     _, is_valid, score = toxicity_scanner.scan(text)
     if not is_valid:
         severity = "high" if score > 0.9 else "medium"
@@ -187,6 +275,7 @@ def run_input_scanners(text: str) -> List[Issue]:
                 scanner="toxicity",
                 severity=severity,
                 message=f"Toxic or abusive prompt detected (score={score:.2f})",
+                action=SCANNER_POLICY["toxicity"],
             )
         )
 
@@ -205,6 +294,7 @@ def run_output_scanners(prompt_text: str, output_text: str) -> List[Issue]:
                 scanner="sensitive_patterns",
                 severity="high",
                 message=f"Sensitive/PII-like patterns detected in output (score={score:.2f})",
+                action=SCANNER_POLICY["sensitive_patterns"],
             )
         )
 
@@ -216,14 +306,23 @@ def health():
     return {"status": "ok"}
 
 
+def _decide(issues: List[Issue]) -> bool:
+    """ok == no issue whose policy action is "block"."""
+    return not any(issue.action == "block" for issue in issues)
+
+
 @app.post("/check-input", response_model=CheckResponse)
 def check_input(req: CheckRequest):
     """Scan an incoming prompt/context before the agent processes it."""
-    if not req.text.strip():
+    segments = _effective_segments(req)
+    text = "\n".join(segments)
+    if not text.strip():
         return CheckResponse(ok=True)
 
-    issues = run_input_scanners(req.text) + run_credential_scanners(req.text)
-    return CheckResponse(ok=len(issues) == 0, issues=issues)
+    issues = run_input_scanners(text) + run_credential_scanners(text)
+    redacted, pii_issues = run_pii_redaction(segments)
+    issues = issues + pii_issues
+    return CheckResponse(ok=_decide(issues), issues=issues, redacted=redacted)
 
 
 @app.post("/check-output", response_model=CheckResponse)
@@ -234,11 +333,15 @@ def check_output(req: CheckRequest):
     In a fuller integration, the caller would also send the original prompt.
     Here we pass empty string as prompt since our regex scanner only looks at output.
     """
-    if not req.text.strip():
+    segments = _effective_segments(req)
+    text = "\n".join(segments)
+    if not text.strip():
         return CheckResponse(ok=True)
 
-    issues = run_output_scanners("", req.text) + run_credential_scanners(req.text)
-    return CheckResponse(ok=len(issues) == 0, issues=issues)
+    issues = run_output_scanners("", text) + run_credential_scanners(text)
+    redacted, pii_issues = run_pii_redaction(segments)
+    issues = issues + pii_issues
+    return CheckResponse(ok=_decide(issues), issues=issues, redacted=redacted)
 
 
 if __name__ == "__main__":

@@ -70,18 +70,18 @@ Format (one JSON object per line to stdout):
   "user_id": "user-or-agent-id-if-known",
   "agent_id": "claude-code|pi|copilot-proxy|unknown",
   "upstream_provider": "openai",
-  "input_decision": "allow|block",
-  "input_issues": [{"scanner": "prompt_injection", "severity": "critical"}],
-  "output_decision": "allow|block|skip|error",
-  "output_issues": [{"scanner": "sensitive_patterns", "severity": "high"}],
+  "input_decision": "allow|redact|block",
+  "input_issues": [{"scanner": "prompt_injection", "severity": "critical", "action": "block"}],
+  "output_decision": "allow|redact|block|skip|error",
+  "output_issues": [{"scanner": "sensitive_patterns", "severity": "high", "action": "block"}],
   "overall_decision": "allow|block|error",
   "latency_ms": 1234
 }
 
 Decision enums (as implemented):
-- input_decision: allow | block
-- output_decision: allow | block | skip (skipped when the input was already blocked) | error (upstream call failed)
-- overall_decision: allow | block | error
+- input_decision: allow | redact (PII masked in the request before the upstream call) | block
+- output_decision: allow | redact (PII masked in the response before the client) | block | skip (skipped when the input was already blocked) | error (upstream call failed)
+- overall_decision: allow | block | error (redacted requests still count as allow)
 
 Properties:
 - Captures who called, what was flagged, and the final decision.
@@ -90,8 +90,8 @@ Properties:
 - stdout is a pure JSON-line stream: uvicorn access logs are disabled (`--no-access-log`) and guardrail/upstream error details are logged to stderr, so collectors can parse every stdout line as JSON.
 
 Future consideration:
-- Add a redact mode that masks sensitive patterns in outputs instead of blocking,
-  adding a "redact" decision value.
+- Per-request redact on/off toggle (e.g. for workloads where masking
+  breaks functionality).
 
 ### 3. Secrets handling for upstream LLM keys
 
@@ -141,7 +141,7 @@ Investigated 2026-08-15 (review doc, item 7). No code change.
 Incident context: a model was asked to chunk a credentials file and the chunks were written to an external-facing database. The exfiltration vector was the **tool-call arguments** in the model response, which the output check originally did not inspect.
 
 Changes:
-- The proxy output check now scans `choices[].message.tool_calls[].function.arguments` in addition to `content` (see `extract_model_response`).
+- The proxy output check now scans `choices[].message.tool_calls[].function.arguments` in addition to `content` (see `build_output_segments`).
 - The guardrail service runs `run_credential_scanners` on **both** `/check-input` and `/check-output` (input hits stop credentials from ever entering model context; output hits stop exfiltration). Coverage:
   - AWS access keys (`AKIA...`, `ASIA...`), GitHub tokens (`gh[opsur]_...`, `github_pat_...`), JWTs (`eyJ...`), PEM private-key blocks.
   - Any URL with embedded basic-auth credentials (`scheme://user:pass@...`), which covers MongoDB, SQL Server (`mssql://`), Postgres, SAP HANA (`hana://`), Azure, Redis, etc.
@@ -182,6 +182,52 @@ Tests: `proxy/test_app.py::test_streaming_request_replays_sse_after_output_check
 `test_streaming_tool_calls_replayed_as_sse`,
 `test_streaming_blocked_output_returns_error_not_sse`.
 
+### 8. PII redaction and per-scanner policy (added 2026-08-15)
+
+Decision: each scanner has an explicit action — `block`, `redact`, or
+`allow` — defined in `SCANNER_POLICY` in the guardrail service:
+
+| Scanner | Action | Rationale |
+|---|---|---|
+| credentials, sensitive_patterns (SSN/card/key shapes), canary, prompt_injection, jailbreak | block | High-confidence secrets or attacks: never leave infra |
+| pii (email, IPv4, phone) | redact | Low confidence, high false-positive surface; mask with `[REDACTED]` and let the call through |
+| toxicity | allow | Logged for review, not a policy boundary in v1 |
+
+Contract: checks send `segments` (per-message input texts / output content
+plus tool-arg strings, parallel to what is scanned) alongside the joined
+`text` (kept for back-compat). The service redacts each segment
+independently (chained one-pattern-at-a-time `OutputRegex(..., redact=True)`
+scanners, because LLM Guard 0.3.16 returns after the first matching pattern)
+and returns `redacted`, a list parallel to `segments`; `issues` gain an
+`action` field; `ok` reflects only block-action scanners.
+
+Substitution (proxy, v1 scope):
+- Input: string content replaced with the redacted text; an all-text-part
+  content list is collapsed to one text part carrying the redacted text; a
+  list containing non-text parts (images, etc.) is forwarded untouched and a
+  note is appended to the audit issues. The model then operates on
+  `[REDACTED]` placeholders.
+- Output: assistant `content` is replaced before the response (and SSE
+  replay) reaches the client. Tool-call arguments are scanned but **not**
+  redacted in v1: they are machine-consumed (DSNs, JSON envelopes) and
+  masking them would silently break tool execution. Credential-shaped hits
+  in arguments still block.
+- Audit: `input_decision`/`output_decision` gain `redact`; `overall_decision`
+  stays `allow` (the request completed).
+
+Known limitation (v1): input redaction changes what the model sees — for a
+coding agent, a redacted email/IP in a user turn may degrade the answer.
+That trade is intentional: PII never reaches the upstream provider.
+
+Tests: `guardrails_service/test_app.py` (`test_check_output_pii_redaction`,
+`test_check_input_segments_redacted_per_segment`,
+`test_toxicity_issue_is_logged_not_blocking`); `proxy/test_app.py`
+(`test_input_redaction_substituted_before_upstream`,
+`test_input_redaction_skipped_for_non_text_content_parts`,
+`test_output_redaction_substituted_into_response`,
+`test_output_redaction_not_applied_to_tool_call_arguments`,
+`test_streaming_output_redacted_in_sse_replay`).
+
 ## Deployment
 
 POC (local):
@@ -204,11 +250,12 @@ Org-wide (future):
 - Proxy fails fast at startup if UPSTREAM_API_KEY is unset; upstream/guardrail error details are logged to stderr, never returned to clients.
 - Verified end-to-end (2026-08-15, against a local OpenAI-compatible mock upstream): benign prompt returned the upstream response (200); model output containing an SSN blocked post-upstream (400, sensitive_patterns); injection prompt blocked pre-upstream (400, prompt_injection). Pure-JSON audit lines written for all three paths with the derived `upstream_provider`.
 - Credential-leak protection added 2026-08-15 (incident-driven): output check covers tool-call arguments; regex credential scanner + `CANARY_TOKENS` exact-match canaries run on inputs and outputs (see section 7).
-- Not yet implemented: redaction, Anthropic-format route (needed for native Claude Code), tenant/user policy scoping, auth on the proxy, Kubernetes manifests.
+- PII redaction added 2026-08-15: per-scanner `block|redact|allow` policy; low-confidence PII (email/IPv4/phone) masked with `[REDACTED]` in inputs (pre-upstream) and assistant content (pre-client, incl. SSE replay); tool-call arguments scanned but not redacted in v1 (see section 8).
+- Not yet implemented: YAML policy config, Anthropic-format route (needed for native Claude Code), tenant/user policy scoping, auth on the proxy, Kubernetes manifests.
 
 ## Known issues (from 2026-08-14 review)
 
 - **[P0, resolved 31a8186]** The proxy now forwards the raw request body verbatim (minus `agent_id`/`user_id`), so `tools`, `tool_choice`, `stream`, `response_format`, etc. reach upstream untouched. Covered by `proxy/test_app.py`.
-- **[P1, resolved]** The output block list is now high-confidence only (SSN, grouped credit cards, API-key/token shapes). Email/phone/IPv4 moved to `redact_candidate_patterns` (non-blocking, reserved for the future redact-only mode).
+- **[P1, resolved]** The output block list is now high-confidence only (SSN, grouped credit cards, API-key/token shapes). Email/phone/IPv4 moved to `redact_candidate_patterns` and are redacted in place (section 8).
 - **[P1, resolved]** `proxy/test_app.py` covers field forwarding, model default, null-content/tool_calls verbatim forwarding, input block, output block, fail-closed 503, fail-open passthrough, and allow-path passthrough (mocked upstream + guardrails).
-- **[P3]** `extract_input_text` scans every non-assistant role (whitelist to system/user/tool per design); `upstream_provider` audit field is hardcoded to "openai"; upstream timeout hardcoded at 120 s.
+- **[P3]** `build_input_segments` scans every non-assistant role (whitelist to system/user/tool per design); `upstream_provider` audit field is hardcoded to "openai"; upstream timeout hardcoded at 120 s.

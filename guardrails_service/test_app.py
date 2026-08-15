@@ -85,8 +85,8 @@ def test_check_input(text: str, expected_ok: bool, scanner_name: str | None):
             True,
             None,
         ),
-        # Low-confidence PII must not block coding-agent output (reserved for
-        # the future redact-only mode).
+        # Low-confidence PII must not block coding-agent output (redacted
+        # instead; see test_check_output_pii_redaction).
         (
             "Server is listening on 127.0.0.1, contact ops@example.com, "
             "phone +1 (555) 123-4567.",
@@ -159,6 +159,70 @@ def test_check_output(text: str, expected_ok: bool, scanner_name: str | None):
         assert len(data["issues"]) > 0
         scanners = [issue["scanner"] for issue in data["issues"]]
         assert scanner_name in scanners
+
+
+def test_check_output_pii_redaction():
+    text = "Server is listening on 127.0.0.1, contact ops@example.com."
+    resp = client.post("/check-output", json={"text": text})
+
+    assert resp.status_code == 200
+    data = resp.json()
+    # Redact-action issues never fail the request.
+    assert data["ok"] is True
+    pii_issues = [i for i in data["issues"] if i["scanner"] == "pii"]
+    assert len(pii_issues) == 1
+    assert pii_issues[0]["action"] == "redact"
+    # Text-only requests get a single-element redacted list back.
+    assert data["redacted"] is not None
+    assert len(data["redacted"]) == 1
+    redacted_text = data["redacted"][0]
+    assert "ops@example.com" not in redacted_text
+    assert "127.0.0.1" not in redacted_text
+    assert "[REDACTED]" in redacted_text
+
+
+def test_check_output_no_redaction_field_when_clean():
+    resp = client.post(
+        "/check-output", json={"text": "The build passed with no issues."}
+    )
+    data = resp.json()
+    assert data["ok"] is True
+    assert data["redacted"] is None
+
+
+def test_check_input_segments_redacted_per_segment():
+    resp = client.post(
+        "/check-input",
+        json={"segments": ["Contact alice@example.com for details", "Refactor the parser module."]},
+    )
+
+    assert resp.status_code == 200
+    data = resp.json()
+    assert data["ok"] is True
+    assert data["redacted"] == [
+        "Contact [REDACTED] for details",
+        "Refactor the parser module.",
+    ]
+
+
+def test_toxicity_issue_is_logged_not_blocking(monkeypatch):
+    import app as service_app
+
+    def _scan(prompt: str):
+        return prompt, False, 0.95
+
+    monkeypatch.setattr(service_app.toxicity_scanner, "scan", _scan)
+
+    resp = client.post(
+        "/check-input", json={"text": "Please update the README with the new version number."}
+    )
+    data = resp.json()
+
+    # allow-action: the call passes, but the issue is retained for audit.
+    assert data["ok"] is True
+    toxic = [i for i in data["issues"] if i["scanner"] == "toxicity"]
+    assert len(toxic) == 1
+    assert toxic[0]["action"] == "allow"
 
 
 def test_canary_token_blocks(monkeypatch):

@@ -7,7 +7,10 @@ For each request:
 2. If allowed, forwards to upstream LLM provider (OpenAI-compatible).
 3. Calls guardrail service /check-output on the model response.
 4. Returns the upstream response to the client, or blocks with an error if
-   either check fails (redaction is a future mode, see docs/proxy-design.md).
+   a check fails on a block-action issue. Redact-action issues (low-confidence
+   PII) are masked in place instead: input messages are redacted before the
+   upstream call, assistant content is redacted before the response (and SSE
+   replay) reaches the client. See docs/proxy-design.md.
 
 Key behaviors:
 - Fail-closed by default if guardrail service is unreachable.
@@ -125,9 +128,22 @@ def write_audit_log(
     print(json.dumps(log.model_dump()), flush=True)
 
 
-async def call_guardrails_check(text: str, endpoint: str, agent_id: Optional[str], user_id: Optional[str]) -> Dict[str, Any]:
-    """Call the guardrail service and return the response."""
+async def call_guardrails_check(
+    text: str,
+    endpoint: str,
+    agent_id: Optional[str],
+    user_id: Optional[str],
+    segments: Optional[List[str]] = None,
+) -> Dict[str, Any]:
+    """Call the guardrail service and return the response.
+
+    `text` is the newline-joined scan text (sent always, for back-compat);
+    `segments` is the per-message/per-part list the service redacts
+    independently, with `redacted` returned parallel to it.
+    """
     payload = {"text": text}
+    if segments:
+        payload["segments"] = segments
     if agent_id:
         payload["agent_id"] = agent_id
     if user_id:
@@ -170,44 +186,114 @@ def message_text(content: Any) -> str:
 SCANNED_INPUT_ROLES = ("system", "user", "tool")
 
 
-def extract_input_text(messages: List[Dict[str, Any]]) -> str:
-    """Extract the text to input-scan from the message list.
+def build_input_segments(messages: List[Dict[str, Any]]) -> tuple:
+    """Build the per-message segments to input-scan.
 
-    Scans system, user, and tool messages only; assistant turns are covered
-    by the output check on the final response.
+    Returns (segments, targets): segments are the non-empty texts of
+    system/user/tool messages only (assistant turns are covered by the
+    output check on the final response), targets the parallel message
+    indices so redacted segments can be substituted back in place.
     """
-    parts = []
-    for m in messages:
+    segments: List[str] = []
+    targets: List[int] = []
+    for idx, m in enumerate(messages):
         if m.get("role") not in SCANNED_INPUT_ROLES:
             continue
         text = message_text(m.get("content"))
         if text.strip():
-            parts.append(text)
-    return "\n".join(parts)
+            segments.append(text)
+            targets.append(idx)
+    return segments, targets
 
 
-def extract_model_response(response_data: Dict[str, Any]) -> str:
-    """Extract the model's response text from the upstream API response.
+def _is_all_text_parts(content: Any) -> bool:
+    return (
+        isinstance(content, list)
+        and len(content) > 0
+        and all(isinstance(p, dict) and p.get("type") == "text" for p in content)
+    )
 
-    Includes tool-call arguments: that is where exfiltration payloads live
-    when the agent's tools write to external systems (DBs, APIs, files).
+
+def substitute_input_redaction(
+    messages: List[Dict[str, Any]],
+    targets: List[int],
+    segments: List[str],
+    redacted: List[str],
+    notes: List[Dict[str, Any]],
+) -> List[Dict[str, Any]]:
+    """Copy `messages` with redacted segment text substituted in place.
+
+    Substitution rules: string content is replaced; an all-text-part content
+    list is replaced by a single text part carrying the redacted text; a
+    list containing non-text parts (images, etc.) is left untouched and
+    recorded in `notes` for the audit log.
     """
-    choices = response_data.get("choices", [])
+    new_messages = [dict(m) for m in messages]
+    for msg_idx, original, red in zip(targets, segments, redacted):
+        if red == original:
+            continue
+        content = new_messages[msg_idx].get("content")
+        if isinstance(content, str):
+            new_messages[msg_idx]["content"] = red
+        elif _is_all_text_parts(content):
+            new_messages[msg_idx]["content"] = [{"type": "text", "text": red}]
+        else:
+            notes.append(
+                {
+                    "scanner": "pii",
+                    "severity": "low",
+                    "message": "redact skipped: message content has non-text parts",
+                    "action": "allow",
+                }
+            )
+    return new_messages
+
+
+def build_output_segments(response_data: Dict[str, Any]) -> tuple:
+    """Build the per-part segments to output-scan from the upstream response.
+
+    Returns (segments, has_content): the assistant content string (if any)
+    first, then each tool-call arguments string. Tool-call arguments are
+    included because that is where exfiltration payloads live when the
+    agent's tools write to external systems (DBs, APIs, files).
+    """
+    choices = response_data.get("choices") or []
     if not choices:
-        return ""
+        return [], False
     message = choices[0].get("message") or {}
-    parts: List[str] = []
+    segments: List[str] = []
+    has_content = False
     content = message.get("content")
     if isinstance(content, str) and content.strip():
-        parts.append(content)
+        segments.append(content)
+        has_content = True
     for tool_call in message.get("tool_calls") or []:
         function = (tool_call or {}).get("function") or {}
         arguments = function.get("arguments")
         if isinstance(arguments, dict):
             arguments = json.dumps(arguments)
         if isinstance(arguments, str) and arguments.strip():
-            parts.append(arguments)
-    return "\n".join(parts)
+            segments.append(arguments)
+    return segments, has_content
+
+
+def substitute_output_redaction(
+    response_data: Dict[str, Any], segments: List[str], redacted: List[str]
+) -> bool:
+    """Redact the assistant content in place from a `redacted` segment.
+
+    Returns True when the content was actually changed. Tool-call arguments
+    are deliberately NOT redacted (v1): they are machine-consumed (DSNs,
+    JSON envelopes) and masking them would silently break tool execution.
+    Credential-shaped hits in arguments still block (see guardrail policy).
+    """
+    if not redacted or not segments or segments[0] == redacted[0]:
+        return False
+    message = response_data["choices"][0]["message"]
+    if not isinstance(message.get("content"), str):
+        return False
+    message["content"] = redacted[0]
+    return True
 
 
 def build_sse_events(response_data: Dict[str, Any], model: str) -> List[str]:
@@ -288,13 +374,14 @@ async def chat_completions(request: Request):
     user_id = req.user_id
 
     # Step 1: Check input via guardrails
-    input_text = extract_input_text(req.messages)
+    input_segments, input_targets = build_input_segments(req.messages)
     try:
         input_result = await call_guardrails_check(
-            text=input_text,
+            text="\n".join(input_segments),
             endpoint="/check-input",
             agent_id=agent_id,
             user_id=user_id,
+            segments=input_segments,
         )
     except HTTPException:
         raise
@@ -325,11 +412,26 @@ async def chat_completions(request: Request):
             detail=f"Request blocked by guardrails. Issues: {input_issues}",
         )
 
+    # Redact-action issues: mask low-confidence PII in the input before it
+    # reaches the model (the model then operates on [REDACTED] placeholders).
+    upstream_messages = req.messages
+    redacted_in = input_result.get("redacted")
+    if redacted_in:
+        redact_notes: List[Dict[str, Any]] = []
+        upstream_messages = substitute_input_redaction(
+            req.messages, input_targets, input_segments, redacted_in, redact_notes
+        )
+        if redact_notes:
+            input_issues = input_issues + redact_notes
+        if any(r != s for r, s in zip(redacted_in, input_segments)):
+            input_decision = "redact"
+
     # Step 2: Forward to upstream LLM provider.
     # Forward the raw body verbatim (minus proxy-only fields) so no OpenAI
     # parameters (tools, tool_choice, stream, response_format, ...) are lost.
     upstream_body = {k: v for k, v in raw.items() if k not in ("agent_id", "user_id")}
     upstream_body["model"] = model
+    upstream_body["messages"] = upstream_messages
     # Always buffer upstream non-streaming: the output check must see the full
     # response before anything reaches the client. Streaming clients get the
     # checked response replayed as SSE (see build_sse_events).
@@ -363,13 +465,14 @@ async def chat_completions(request: Request):
         raise HTTPException(status_code=502, detail="Upstream LLM error")
 
     # Step 3: Check output via guardrails
-    model_response = extract_model_response(response_data)
+    output_segments, output_has_content = build_output_segments(response_data)
     try:
         output_result = await call_guardrails_check(
-            text=model_response,
+            text="\n".join(output_segments),
             endpoint="/check-output",
             agent_id=agent_id,
             user_id=user_id,
+            segments=output_segments,
         )
     except HTTPException:
         raise
@@ -399,6 +502,15 @@ async def chat_completions(request: Request):
             status_code=400,
             detail=f"Response blocked by guardrails. Issues: {output_issues}",
         )
+
+    # Redact-action issues: mask low-confidence PII in the assistant content
+    # before it reaches the client. build_sse_events reads response_data, so
+    # the redacted content propagates to streaming replays automatically.
+    redacted_out = output_result.get("redacted")
+    if output_has_content and redacted_out and substitute_output_redaction(
+        response_data, output_segments, redacted_out
+    ):
+        output_decision = "redact"
 
     # Step 4: Return allowed response. Streaming clients receive the checked
     # response replayed as an SSE stream; the block above still fires before

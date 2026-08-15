@@ -32,6 +32,8 @@ def _install_http_stub(
     upstream_content="hello",
     guardrail_texts=None,
     upstream_response=None,
+    input_redacted=None,
+    output_redacted=None,
 ):
     """Route the proxy's outbound httpx calls to a MockTransport."""
 
@@ -39,11 +41,15 @@ def _install_http_stub(
         if request.url.path.endswith("/check-input"):
             if guardrail_texts is not None:
                 guardrail_texts.append(json.loads(request.content)["text"])
-            return httpx.Response(200, json={"ok": input_ok, "issues": []})
+            return httpx.Response(
+                200, json={"ok": input_ok, "issues": [], "redacted": input_redacted}
+            )
         if request.url.path.endswith("/check-output"):
             if guardrail_texts is not None:
                 guardrail_texts.append(json.loads(request.content)["text"])
-            return httpx.Response(200, json={"ok": output_ok, "issues": []})
+            return httpx.Response(
+                200, json={"ok": output_ok, "issues": [], "redacted": output_redacted}
+            )
         if request.url.path.endswith("/chat/completions"):
             captured.append(json.loads(request.content))
             body = upstream_response or {
@@ -419,3 +425,148 @@ def test_streaming_blocked_output_returns_error_not_sse(monkeypatch):
     assert resp.status_code == 400
     assert "chat.completion.chunk" not in resp.text
     assert "123-45-6789" not in resp.text
+
+
+def test_input_redaction_substituted_before_upstream(monkeypatch):
+    captured: list = []
+    _install_http_stub(
+        monkeypatch,
+        captured,
+        input_redacted=["Email [REDACTED] for details"],
+    )
+
+    resp = client.post(
+        "/v1/chat/completions",
+        json={"messages": [{"role": "user", "content": "Email alice@example.com for details"}]},
+    )
+
+    assert resp.status_code == 200
+    # The model must see the masked text, not the address.
+    assert captured[0]["messages"][0]["content"] == "Email [REDACTED] for details"
+
+
+def test_input_redaction_unchanged_segments_forward_verbatim(monkeypatch):
+    captured: list = []
+    # redacted list identical to input -> no substitution, no redact decision.
+    _install_http_stub(
+        monkeypatch,
+        captured,
+        input_redacted=["Refactor the parser module."],
+    )
+
+    resp = client.post(
+        "/v1/chat/completions",
+        json={"messages": [{"role": "user", "content": "Refactor the parser module."}]},
+    )
+
+    assert resp.status_code == 200
+    assert captured[0]["messages"][0]["content"] == "Refactor the parser module."
+
+
+def test_input_redaction_skipped_for_non_text_content_parts(monkeypatch):
+    """Messages with non-text parts (images) cannot be substituted safely;
+    they must reach upstream untouched."""
+    captured: list = []
+    content = [
+        {"type": "text", "text": "mail ops@example.com"},
+        {"type": "image_url", "image_url": {"url": "http://img/x.png"}},
+    ]
+    _install_http_stub(monkeypatch, captured, input_redacted=["mail [REDACTED]"])
+
+    resp = client.post(
+        "/v1/chat/completions",
+        json={"messages": [{"role": "user", "content": content}]},
+    )
+
+    assert resp.status_code == 200
+    assert captured[0]["messages"][0]["content"] == content
+
+
+def test_output_redaction_substituted_into_response(monkeypatch, capsys):
+    captured: list = []
+    _install_http_stub(
+        monkeypatch,
+        captured,
+        upstream_content="Call +1 (555) 123-4567 now",
+        output_redacted=["Call [REDACTED] now"],
+    )
+
+    resp = client.post(
+        "/v1/chat/completions",
+        json={"messages": [{"role": "user", "content": "Who do I call?"}]},
+    )
+
+    assert resp.status_code == 200
+    assert resp.json()["choices"][0]["message"]["content"] == "Call [REDACTED] now"
+    # Audit trail records the redact decision with an overall allow.
+    audit_lines = [
+        json.loads(line)
+        for line in capsys.readouterr().out.splitlines()
+        if line.strip().startswith("{")
+    ]
+    assert len(audit_lines) == 1
+    assert audit_lines[0]["output_decision"] == "redact"
+    assert audit_lines[0]["overall_decision"] == "allow"
+
+
+def test_output_redaction_not_applied_to_tool_call_arguments(monkeypatch):
+    """Tool arguments are machine-consumed; v1 scans them but never masks them."""
+    captured: list = []
+    _install_http_stub(
+        monkeypatch,
+        captured,
+        upstream_response={
+            "choices": [
+                {
+                    "message": {
+                        "role": "assistant",
+                        "content": None,
+                        "tool_calls": [
+                            {
+                                "id": "call_1",
+                                "type": "function",
+                                "function": {
+                                    "name": "db_insert",
+                                    "arguments": json.dumps({"email": "ops@example.com"}),
+                                },
+                            }
+                        ],
+                    },
+                    "finish_reason": "tool_calls",
+                }
+            ]
+        },
+        output_redacted=['{"email": "[REDACTED]"}'],
+    )
+
+    resp = client.post(
+        "/v1/chat/completions",
+        json={"messages": [{"role": "user", "content": "Store the row."}]},
+    )
+
+    assert resp.status_code == 200
+    arguments = resp.json()["choices"][0]["message"]["tool_calls"][0]["function"]["arguments"]
+    assert json.loads(arguments) == {"email": "ops@example.com"}
+
+
+def test_streaming_output_redacted_in_sse_replay(monkeypatch):
+    captured: list = []
+    _install_http_stub(
+        monkeypatch,
+        captured,
+        upstream_content="Phone: +1 (555) 123-4567",
+        output_redacted=["Phone: [REDACTED]"],
+    )
+
+    resp = client.post(
+        "/v1/chat/completions",
+        json={
+            "model": "gpt-4o",
+            "stream": True,
+            "messages": [{"role": "user", "content": "Anything."}],
+        },
+    )
+
+    assert resp.status_code == 200
+    assert "[REDACTED]" in resp.text
+    assert "+1 (555) 123-4567" not in resp.text

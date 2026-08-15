@@ -3,10 +3,11 @@
 Local guardrail service and proxy using LLM Guard to scan prompts and responses for:
 - Prompt injection / jailbreak attempts (input)
 - Toxicity in prompts (input)
-- Sensitive patterns in outputs: API keys/tokens, SSNs, credit cards (output, regex-based; low-confidence PII like emails/IPs/phones is intentionally not blocking)
+- Sensitive patterns in outputs: API keys/tokens, SSNs, credit cards (output, regex-based)
+- Per-scanner policy: credential-shaped patterns, prompt injection, and canaries **block**; low-confidence PII (emails, IPv4, phone numbers) is **redacted in place** (`[REDACTED]`) and let through; toxicity is **logged but not blocking**
 - Credential leaks (input and output, incl. tool-call arguments): AWS keys, GitHub tokens, JWTs, PEM private keys, connection strings with embedded passwords, `password=`/`secret:` assignments, and exact-match canary tokens
 
-Designed to protect coding agents (Pi/OMP, Claude Code, Codex, etc.) via a centralized enforcement layer.
+Designed to protect coding agents (Pi/OMP, Claude Code, Codex, Hermes, OpenClaw, etc.) via a centralized enforcement layer.
 
 See `docs/proxy-design.md` for architecture and design decisions.
 
@@ -21,6 +22,7 @@ See `docs/proxy-design.md` for architecture and design decisions.
   - OpenAI-compatible HTTP proxy that enforces guardrails around every LLM call.
   - Sits between your tools and the upstream LLM provider.
   - Input check covers system, user, and tool messages; output check covers the model response including tool-call arguments (where exfiltration payloads to external systems appear).
+  - Redacts low-confidence PII in place before it reaches the model or client; blocks credential-shaped patterns, prompt injection, and canaries.
   - Accepts OpenAI message content as a string, content-part list, or null.
   - Fail-closed by default if guardrails are unreachable.
   - Refuses to start if UPSTREAM_API_KEY is not set.
@@ -48,6 +50,8 @@ UPSTREAM_API_KEY="sk-your-key-here"
 ```
 
 The proxy exits at startup with a clear error if the key is missing; the guardrail service alone does not need it.
+
+Running a local model (Ollama, vLLM, LiteLLM, etc. via `UPSTREAM_API_BASE`)? No real key is needed — set `UPSTREAM_API_KEY=na` as a placeholder to satisfy the startup check.
 
 Optional overrides (uncomment in `.env`):
 - `UPSTREAM_API_BASE` (default: https://api.openai.com/v1)
