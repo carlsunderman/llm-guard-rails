@@ -6,7 +6,8 @@ For each request:
 1. Calls guardrail service /check-input on the input text (system, user, and tool messages).
 2. If allowed, forwards to upstream LLM provider (OpenAI-compatible).
 3. Calls guardrail service /check-output on the model response.
-4. Returns final response (allow/block/redact) to the client.
+4. Returns the upstream response to the client, or blocks with an error if
+   either check fails (redaction is a future mode, see docs/proxy-design.md).
 
 Key behaviors:
 - Fail-closed by default if guardrail service is unreachable.
@@ -20,6 +21,7 @@ import sys
 import time
 import uuid
 from typing import Any, Dict, List, Optional
+from urllib.parse import urlparse
 
 import httpx
 from fastapi import FastAPI, HTTPException, Request
@@ -35,6 +37,19 @@ UPSTREAM_MODEL = os.getenv("UPSTREAM_MODEL", "gpt-4o")
 
 FAIL_CLOSED = os.getenv("FAIL_CLOSED", "true").lower() in ("true", "1", "yes")
 GUARDRAILS_TIMEOUT = float(os.getenv("GUARDRAILS_TIMEOUT_SECONDS", "3"))
+UPSTREAM_TIMEOUT = float(os.getenv("UPSTREAM_TIMEOUT_SECONDS", "120"))
+
+
+def infer_upstream_provider(base_url: str) -> str:
+    host = urlparse(base_url).netloc.lower()
+    if "openai" in host:
+        return "openai"
+    if "anthropic" in host:
+        return "anthropic"
+    return host or "unknown"
+
+
+UPSTREAM_PROVIDER = infer_upstream_provider(UPSTREAM_API_BASE)
 
 if not UPSTREAM_API_KEY:
     raise SystemExit(
@@ -80,8 +95,32 @@ class AuditLog(BaseModel):
     latency_ms: int
 
 
-def write_audit_log(log: AuditLog):
+def write_audit_log(
+    *,
+    request_id: str,
+    agent_id: str,
+    user_id: Optional[str],
+    input_decision: str,
+    input_issues: List[Dict[str, Any]],
+    output_decision: str,
+    output_issues: List[Dict[str, Any]],
+    overall_decision: str,
+    start_time: float,
+) -> None:
     """Write a single JSON-line audit log to stdout."""
+    log = AuditLog(
+        timestamp=time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        request_id=request_id,
+        user_id=user_id,
+        agent_id=agent_id,
+        upstream_provider=UPSTREAM_PROVIDER,
+        input_decision=input_decision,
+        input_issues=input_issues,
+        output_decision=output_decision,
+        output_issues=output_issues,
+        overall_decision=overall_decision,
+        latency_ms=int((time.time() - start_time) * 1000),
+    )
     print(json.dumps(log.model_dump()), flush=True)
 
 
@@ -124,15 +163,21 @@ def message_text(content: Any) -> str:
     return ""
 
 
+# Roles whose text is input-scanned (see docs/proxy-design.md, "Input scan
+# scope"). Assistant turns are covered by the output check on the final
+# response; other roles are not scanned.
+SCANNED_INPUT_ROLES = ("system", "user", "tool")
+
+
 def extract_input_text(messages: List[Dict[str, Any]]) -> str:
     """Extract the text to input-scan from the message list.
 
-    Scans system, user, and tool messages; assistant turns are covered by
-    the output check on the final response.
+    Scans system, user, and tool messages only; assistant turns are covered
+    by the output check on the final response.
     """
     parts = []
     for m in messages:
-        if m.get("role") == "assistant":
+        if m.get("role") not in SCANNED_INPUT_ROLES:
             continue
         text = message_text(m.get("content"))
         if text.strip():
@@ -191,21 +236,16 @@ async def chat_completions(request: Request):
 
     if not input_result.get("ok"):
         # Block the request
-        latency_ms = int((time.time() - start_time) * 1000)
         write_audit_log(
-            AuditLog(
-                timestamp=time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
-                request_id=request_id,
-                user_id=user_id,
-                agent_id=agent_id,
-                upstream_provider="openai",
-                input_decision=input_decision,
-                input_issues=input_issues,
-                output_decision="skip",
-                output_issues=[],
-                overall_decision="block",
-                latency_ms=latency_ms,
-            )
+            request_id=request_id,
+            agent_id=agent_id,
+            user_id=user_id,
+            input_decision=input_decision,
+            input_issues=input_issues,
+            output_decision="skip",
+            output_issues=[],
+            overall_decision="block",
+            start_time=start_time,
         )
         raise HTTPException(
             status_code=400,
@@ -219,7 +259,7 @@ async def chat_completions(request: Request):
     upstream_body["model"] = model
 
     try:
-        async with httpx.AsyncClient(timeout=120) as client:
+        async with httpx.AsyncClient(timeout=UPSTREAM_TIMEOUT) as client:
             upstream_resp = await client.post(
                 f"{UPSTREAM_API_BASE}/chat/completions",
                 headers={
@@ -232,21 +272,16 @@ async def chat_completions(request: Request):
             response_data = upstream_resp.json()
     except Exception:
         logger.exception("Upstream LLM call failed (model=%s)", model)
-        latency_ms = int((time.time() - start_time) * 1000)
         write_audit_log(
-            AuditLog(
-                timestamp=time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
-                request_id=request_id,
-                user_id=user_id,
-                agent_id=agent_id,
-                upstream_provider="openai",
-                input_decision=input_decision,
-                input_issues=input_issues,
-                output_decision="error",
-                output_issues=[],
-                overall_decision="error",
-                latency_ms=latency_ms,
-            )
+            request_id=request_id,
+            agent_id=agent_id,
+            user_id=user_id,
+            input_decision=input_decision,
+            input_issues=input_issues,
+            output_decision="error",
+            output_issues=[],
+            overall_decision="error",
+            start_time=start_time,
         )
         raise HTTPException(status_code=502, detail="Upstream LLM error")
 
@@ -272,21 +307,16 @@ async def chat_completions(request: Request):
 
     if not output_result.get("ok"):
         # Block the response
-        latency_ms = int((time.time() - start_time) * 1000)
         write_audit_log(
-            AuditLog(
-                timestamp=time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
-                request_id=request_id,
-                user_id=user_id,
-                agent_id=agent_id,
-                upstream_provider="openai",
-                input_decision=input_decision,
-                input_issues=input_issues,
-                output_decision=output_decision,
-                output_issues=output_issues,
-                overall_decision="block",
-                latency_ms=latency_ms,
-            )
+            request_id=request_id,
+            agent_id=agent_id,
+            user_id=user_id,
+            input_decision=input_decision,
+            input_issues=input_issues,
+            output_decision=output_decision,
+            output_issues=output_issues,
+            overall_decision="block",
+            start_time=start_time,
         )
         raise HTTPException(
             status_code=400,
@@ -294,21 +324,16 @@ async def chat_completions(request: Request):
         )
 
     # Step 4: Return allowed response
-    latency_ms = int((time.time() - start_time) * 1000)
     write_audit_log(
-        AuditLog(
-            timestamp=time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
-            request_id=request_id,
-            user_id=user_id,
-            agent_id=agent_id,
-            upstream_provider="openai",
-            input_decision=input_decision,
-            input_issues=input_issues,
-            output_decision=output_decision,
-            output_issues=output_issues,
-            overall_decision="allow",
-            latency_ms=latency_ms,
-        )
+        request_id=request_id,
+        agent_id=agent_id,
+        user_id=user_id,
+        input_decision=input_decision,
+        input_issues=input_issues,
+        output_decision=output_decision,
+        output_issues=output_issues,
+        overall_decision="allow",
+        start_time=start_time,
     )
 
     return response_data

@@ -32,6 +32,7 @@ services:
       - UPSTREAM_MODEL=${UPSTREAM_MODEL:-gpt-4o}
       - FAIL_CLOSED=${FAIL_CLOSED:-true}
       - GUARDRAILS_TIMEOUT_SECONDS=${GUARDRAILS_TIMEOUT_SECONDS:-3}
+      - UPSTREAM_TIMEOUT_SECONDS=${UPSTREAM_TIMEOUT_SECONDS:-120}
     restart: unless-stopped
     depends_on:
       guardrails:

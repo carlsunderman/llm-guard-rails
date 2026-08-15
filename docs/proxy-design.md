@@ -54,6 +54,7 @@ Behavior:
 Configuration:
 - FAIL_CLOSED=true|false (default true)
 - GUARDRAILS_TIMEOUT_SECONDS=3
+- UPSTREAM_TIMEOUT_SECONDS=120 (upstream LLM call timeout)
 
 Future consideration:
 - Per-policy severity rules (e.g., fail-closed for critical scanners, fail-open for lower-severity checks).
