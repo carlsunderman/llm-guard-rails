@@ -17,7 +17,6 @@ os.environ.setdefault("GUARDRAILS_URL", "http://guardrails.test:8090")
 os.environ.setdefault("FAIL_CLOSED", "true")
 
 import httpx
-import pytest
 from fastapi.testclient import TestClient
 
 import app as proxy_app

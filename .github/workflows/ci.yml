@@ -1,0 +1,43 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install ruff
+      - run: ruff check guardrails_service proxy
+
+  proxy-tests:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install -r proxy/requirements.txt pytest
+      - working-directory: proxy
+        run: python -m pytest test_app.py -q
+
+  guardrails-tests:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build guardrails image
+        run: docker compose build guardrails
+      # Tests must run in the container (llm-guard + HF models are only
+      # installed there). The service dir is mounted so the test file is
+      # available; the image only copies app.py.
+      - name: Run guardrails tests in container
+        run: >
+          docker compose run --rm --no-deps
+          -v "$GITHUB_WORKSPACE/guardrails_service:/app"
+          guardrails python -m pytest test_app.py -q
