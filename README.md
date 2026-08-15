@@ -36,22 +36,28 @@ See `docs/proxy-design.md` for architecture and design decisions.
 
 ## Run locally
 
-### 1. Configure upstream API key
+### 1. Configure the environment
 
-Set your upstream API key as an environment variable:
+Put all configuration and secrets in the project-root `.env` file (gitignored; a template is included). Docker Compose reads it automatically for `${VAR}` substitution — no shell exports needed.
+
+Required: set your upstream API key:
 
 ```bash
-export UPSTREAM_API_KEY="sk-your-key-here"
+# .env
+UPSTREAM_API_KEY="sk-your-key-here"
 ```
 
 The proxy exits at startup with a clear error if the key is missing; the guardrail service alone does not need it.
 
-Optional overrides:
+Optional overrides (uncomment in `.env`):
 - `UPSTREAM_API_BASE` (default: https://api.openai.com/v1)
 - `UPSTREAM_MODEL` (default: gpt-4o)
 - `FAIL_CLOSED` (default: true; set to false for fail-open behavior)
 - `GUARDRAILS_TIMEOUT_SECONDS` (default: 3)
+- `UPSTREAM_TIMEOUT_SECONDS` (default: 120)
 - `CANARY_TOKENS` (guardrail service; comma-separated exact-match tokens to detect in prompts and outputs, e.g. seeded canary credentials)
+
+Note: shell-exported variables take precedence over `.env`, so a stale `export UPSTREAM_API_KEY=...` in your shell will override the file.
 
 ### 2. Build and start services
 
