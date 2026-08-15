@@ -100,7 +100,7 @@ curl -s http://localhost:8000/v1/chat/completions \
   }' | jq
 ```
 
-The proxy scans system, user, and tool messages before the upstream call and the model response after it; if either check fails, it returns an error instead of the LLM output.
+The proxy scans system, user, and tool messages before the upstream call and the model response (content and tool-call arguments) after it; if either check fails, it returns an error instead of the LLM output. Streaming requests (`"stream": true`) are buffered upstream, checked, and only then replayed to the client as a standard SSE stream, so a block still reaches the client before any model bytes.
 
 Audit logs are printed as JSON lines to the proxy container’s stdout (stdout is a pure JSON stream; uvicorn access logs are disabled):
 
@@ -132,10 +132,52 @@ Mock triggers:
 
 Audit lines for each decision are visible via `docker logs agent-guardrails-proxy`.
 
-## Integrations
+## Client integrations
 
-- **Pi/OMP**: load `skills/agent-guardrails.md` as a skill for agent-level guidance; configure model calls through the proxy for hard enforcement.
-- **Claude Code / Codex**: use `hooks/claude-code-guardrails.sh` as a pre/post-turn hook (text via stdin; exit 0 = ok, 1 = blocked with details, 2 = service error), or route their API calls through the proxy via environment variables (e.g., custom base URL).
+Point each tool at `http://localhost:8000/v1`. The proxy is OpenAI Chat Completions-compatible (non-streaming and streaming; streaming responses are buffered, checked, then replayed as SSE).
+
+### Pi (and other pi-based tools)
+
+Add the proxy as a provider in `~/.pi/agent/models.json` (reloads on every `/model`, no restart):
+
+```json
+{
+  "providers": {
+    "guardrails": {
+      "baseUrl": "http://localhost:8000/v1",
+      "api": "openai-completions",
+      "apiKey": "guardrails",
+      "models": [
+        { "id": "gpt-4o", "name": "gpt-4o (via guardrails proxy)" }
+      ]
+    }
+  }
+}
+```
+
+The `apiKey` is a dummy (the proxy authenticates upstream itself); the model `id` is forwarded to the upstream verbatim. Then select `guardrails/gpt-4o` via `/model`. Tools that wrap pi inherit the same config. For agent-level guidance, also load `skills/agent-guardrails.md` as a skill.
+
+### Codex
+
+`~/.codex/config.toml` (exact keys vary slightly by Codex version):
+
+```toml
+model_provider = "guardrails"
+model = "gpt-4o"
+
+[model_providers.guardrails]
+name = "Guardrails Proxy"
+base_url = "http://localhost:8000/v1"
+wire_api = "chat"
+```
+
+### Claude Code
+
+Claude Code speaks the Anthropic Messages API natively, so it cannot use this OpenAI-compatible proxy as its endpoint directly. Use `hooks/claude-code-guardrails.sh` as a pre/post-turn hook (text via stdin; exit 0 = ok, 1 = blocked with details, 2 = service error) for text-level enforcement. Direct proxy support requires an Anthropic-format route (roadmap, see `docs/proxy-design.md`).
+
+### Any OpenAI-compatible client
+
+Anything that accepts a base URL works: set the base URL to `http://localhost:8000/v1` with any non-empty API key. The proxy's own `UPSTREAM_API_KEY` is what authenticates to the provider.
 
 ## Design decisions
 

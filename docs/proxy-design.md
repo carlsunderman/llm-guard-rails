@@ -151,8 +151,36 @@ Changes:
 Known limits (honest scope):
 - Unstructured plaintext credential dumps (bare `user123  hunter22` lines with no key/URL structure) are **not** detectable by regex; that needs a classifier or a known-value list (e.g. sync real usernames and match against them).
 - Protection covers the LLM API path only. Tool executions that never traverse the model (direct file writes, direct HTTP) are out of scope; extend the Claude Code hook or add egress-side detection for those.
-- Streaming responses (`"stream": true`) are not output-checked: the proxy's response parsing fails and the request errors (fail-closed, nothing leaks), but there is no streamed-inspection path yet.
+- Streaming is handled via buffer-then-replay (see section 8): responses are fully checked before any bytes reach the client, at the cost of incremental token latency.
 - Matched values are never echoed into issues or logs.
+
+### 8. Streaming responses: buffer-then-replay (added 2026-08-15)
+
+Problem: the output check needs the full response (content and tool-call
+arguments) before anything reaches the client, but streaming clients (pi,
+and most agent harnesses) send `stream: true` and expect an SSE stream.
+Forwarding the upstream SSE pass-through would deliver model bytes to the
+client before the check could run.
+
+Decision: the proxy always requests upstream with `stream: false`, runs the
+output check, and then:
+- non-streaming clients receive the upstream JSON unchanged;
+- streaming clients receive the checked response **replayed** as a standard
+  OpenAI SSE stream (role chunk, content chunk, tool-call chunks,
+  finish-reason chunk, `[DONE]`), synthesized by `build_sse_events`.
+
+Properties:
+- A block (400) is returned before any model byte reaches the client, for
+  both stream and non-stream requests.
+- Tool-call arguments are part of the replayed stream and were part of the
+  scanned text.
+- Trade-off: no incremental tokens until the full response is generated.
+  Acceptable for agent workloads (tool calls matter more than typing speed);
+  revisit with chunked scanning if interactive latency ever matters.
+
+Tests: `proxy/test_app.py::test_streaming_request_replays_sse_after_output_check`,
+`test_streaming_tool_calls_replayed_as_sse`,
+`test_streaming_blocked_output_returns_error_not_sse`.
 
 ## Deployment
 
@@ -176,7 +204,7 @@ Org-wide (future):
 - Proxy fails fast at startup if UPSTREAM_API_KEY is unset; upstream/guardrail error details are logged to stderr, never returned to clients.
 - Verified end-to-end (2026-08-15, against a local OpenAI-compatible mock upstream): benign prompt returned the upstream response (200); model output containing an SSN blocked post-upstream (400, sensitive_patterns); injection prompt blocked pre-upstream (400, prompt_injection). Pure-JSON audit lines written for all three paths with the derived `upstream_provider`.
 - Credential-leak protection added 2026-08-15 (incident-driven): output check covers tool-call arguments; regex credential scanner + `CANARY_TOKENS` exact-match canaries run on inputs and outputs (see section 7).
-- Not yet implemented: redaction, streaming-response inspection, Anthropic-format route, tenant/user policy scoping, auth on the proxy, Kubernetes manifests.
+- Not yet implemented: redaction, Anthropic-format route (needed for native Claude Code), tenant/user policy scoping, auth on the proxy, Kubernetes manifests.
 
 ## Known issues (from 2026-08-14 review)
 

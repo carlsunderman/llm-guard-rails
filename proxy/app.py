@@ -25,6 +25,7 @@ from urllib.parse import urlparse
 
 import httpx
 from fastapi import FastAPI, HTTPException, Request
+from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, ValidationError
 
 app = FastAPI(title="LLM Guardrail Proxy", version="0.1.0")
@@ -209,6 +210,63 @@ def extract_model_response(response_data: Dict[str, Any]) -> str:
     return "\n".join(parts)
 
 
+def build_sse_events(response_data: Dict[str, Any], model: str) -> List[str]:
+    """Synthesize an OpenAI-compatible SSE stream from a buffered response.
+
+    The proxy always pulls from upstream non-streaming so the output check
+    runs before any model bytes reach the client. Streaming clients then
+    receive the fully checked response replayed as standard
+    chat.completion.chunk events (content, tool calls, finish, [DONE]).
+    Trade-off: no incremental tokens until the full response is generated.
+    """
+    choices = response_data.get("choices") or [{}]
+    message = choices[0].get("message") or {}
+    base_id = response_data.get("id") or f"chatcmpl-{uuid.uuid4().hex[:24]}"
+    created = int(response_data.get("created") or time.time())
+    model_name = response_data.get("model") or model
+
+    def chunk(delta: Dict[str, Any], finish_reason: Optional[str] = None) -> str:
+        payload = {
+            "id": base_id,
+            "object": "chat.completion.chunk",
+            "created": created,
+            "model": model_name,
+            "choices": [{"index": 0, "delta": delta, "finish_reason": finish_reason}],
+        }
+        return f"data: {json.dumps(payload)}\n\n"
+
+    events: List[str] = [chunk({"role": "assistant", "content": ""})]
+    content = message.get("content")
+    if isinstance(content, str) and content:
+        events.append(chunk({"content": content}))
+    for i, tool_call in enumerate(message.get("tool_calls") or []):
+        function = tool_call.get("function") or {}
+        arguments = function.get("arguments")
+        if not isinstance(arguments, str):
+            arguments = json.dumps(arguments or {})
+        events.append(
+            chunk(
+                {
+                    "tool_calls": [
+                        {
+                            "index": i,
+                            "id": tool_call.get("id", ""),
+                            "type": "function",
+                            "function": {
+                                "name": function.get("name", ""),
+                                "arguments": arguments,
+                            },
+                        }
+                    ]
+                }
+            )
+        )
+    finish = choices[0].get("finish_reason") or "stop"
+    events.append(chunk({}, finish))
+    events.append("data: [DONE]\n\n")
+    return events
+
+
 @app.post("/v1/chat/completions")
 async def chat_completions(request: Request):
     """OpenAI-compatible chat completions endpoint with guardrail enforcement."""
@@ -272,6 +330,10 @@ async def chat_completions(request: Request):
     # parameters (tools, tool_choice, stream, response_format, ...) are lost.
     upstream_body = {k: v for k, v in raw.items() if k not in ("agent_id", "user_id")}
     upstream_body["model"] = model
+    # Always buffer upstream non-streaming: the output check must see the full
+    # response before anything reaches the client. Streaming clients get the
+    # checked response replayed as SSE (see build_sse_events).
+    upstream_body["stream"] = False
 
     try:
         async with httpx.AsyncClient(timeout=UPSTREAM_TIMEOUT) as client:
@@ -338,7 +400,14 @@ async def chat_completions(request: Request):
             detail=f"Response blocked by guardrails. Issues: {output_issues}",
         )
 
-    # Step 4: Return allowed response
+    # Step 4: Return allowed response. Streaming clients receive the checked
+    # response replayed as an SSE stream; the block above still fires before
+    # any bytes reach them.
+    if raw.get("stream"):
+        return StreamingResponse(
+            iter(build_sse_events(response_data, model)),
+            media_type="text/event-stream",
+        )
     write_audit_log(
         request_id=request_id,
         agent_id=agent_id,

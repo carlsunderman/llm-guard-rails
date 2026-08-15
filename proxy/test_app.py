@@ -31,6 +31,7 @@ def _install_http_stub(
     output_ok=True,
     upstream_content="hello",
     guardrail_texts=None,
+    upstream_response=None,
 ):
     """Route the proxy's outbound httpx calls to a MockTransport."""
 
@@ -45,10 +46,10 @@ def _install_http_stub(
             return httpx.Response(200, json={"ok": output_ok, "issues": []})
         if request.url.path.endswith("/chat/completions"):
             captured.append(json.loads(request.content))
-            return httpx.Response(
-                200,
-                json={"choices": [{"message": {"role": "assistant", "content": upstream_content}}]},
-            )
+            body = upstream_response or {
+                "choices": [{"message": {"role": "assistant", "content": upstream_content}}]
+            }
+            return httpx.Response(200, json=body)
         return httpx.Response(404)
 
     class HttpxShim:
@@ -312,3 +313,109 @@ def test_allow_path_returns_upstream_response_verbatim(monkeypatch):
     assert resp.status_code == 200
     assert resp.json() == {"choices": [{"message": {"role": "assistant", "content": "42"}}]}
     assert len(captured) == 1
+
+def test_streaming_request_replays_sse_after_output_check(monkeypatch):
+    captured: list = []
+    guardrail_texts: list = []
+    _install_http_stub(
+        monkeypatch,
+        captured,
+        upstream_content="Streamed answer.",
+        guardrail_texts=guardrail_texts,
+    )
+
+    resp = client.post(
+        "/v1/chat/completions",
+        json={
+            "model": "gpt-4o",
+            "stream": True,
+            "messages": [{"role": "user", "content": "Say hi."}],
+        },
+    )
+
+    assert resp.status_code == 200
+    assert resp.headers["content-type"].startswith("text/event-stream")
+    # upstream was pulled non-streaming so the output check could run first
+    assert captured[0]["stream"] is False
+    # the output check saw the content before it was replayed
+    assert "Streamed answer." in guardrail_texts[1]
+    body = resp.text
+    assert '"object": "chat.completion.chunk"' in body
+    assert "Streamed answer." in body
+    assert '"finish_reason": "stop"' in body
+    assert body.rstrip().endswith("data: [DONE]")
+
+
+def test_streaming_tool_calls_replayed_as_sse(monkeypatch):
+    captured: list = []
+    _install_http_stub(
+        monkeypatch,
+        captured,
+        upstream_response={
+            "choices": [
+                {
+                    "message": {
+                        "role": "assistant",
+                        "content": None,
+                        "tool_calls": [
+                            {
+                                "id": "call_9",
+                                "type": "function",
+                                "function": {
+                                    "name": "db_lookup",
+                                    "arguments": '{"table": "orders"}',
+                                },
+                            }
+                        ],
+                    },
+                    "finish_reason": "tool_calls",
+                }
+            ]
+        },
+    )
+
+    resp = client.post(
+        "/v1/chat/completions",
+        json={
+            "model": "gpt-4o",
+            "stream": True,
+            "messages": [{"role": "user", "content": "Query orders."}],
+        },
+    )
+
+    assert resp.status_code == 200
+    body = resp.text
+    events = [
+        json.loads(line[len("data: "):])
+        for line in body.splitlines()
+        if line.startswith("data: ") and line.strip() != "data: [DONE]"
+    ]
+    tc_chunk = next(e for e in events if e["choices"][0]["delta"].get("tool_calls"))
+    fn = tc_chunk["choices"][0]["delta"]["tool_calls"][0]["function"]
+    assert fn["name"] == "db_lookup"
+    assert json.loads(fn["arguments"]) == {"table": "orders"}
+    assert events[-1]["choices"][0]["finish_reason"] == "tool_calls"
+
+
+def test_streaming_blocked_output_returns_error_not_sse(monkeypatch):
+    captured: list = []
+    _install_http_stub(
+        monkeypatch,
+        captured,
+        output_ok=False,
+        upstream_content="ssn 123-45-6789 leaked",
+    )
+
+    resp = client.post(
+        "/v1/chat/completions",
+        json={
+            "model": "gpt-4o",
+            "stream": True,
+            "messages": [{"role": "user", "content": "Anything."}],
+        },
+    )
+
+    # blocked before any byte reaches the client
+    assert resp.status_code == 400
+    assert "chat.completion.chunk" not in resp.text
+    assert "123-45-6789" not in resp.text
