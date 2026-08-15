@@ -205,26 +205,6 @@ def test_check_input_segments_redacted_per_segment():
     ]
 
 
-def test_toxicity_issue_is_logged_not_blocking(monkeypatch):
-    import app as service_app
-
-    def _scan(prompt: str):
-        return prompt, False, 0.95
-
-    monkeypatch.setattr(service_app.toxicity_scanner, "scan", _scan)
-
-    resp = client.post(
-        "/check-input", json={"text": "Please update the README with the new version number."}
-    )
-    data = resp.json()
-
-    # allow-action: the call passes, but the issue is retained for audit.
-    assert data["ok"] is True
-    toxic = [i for i in data["issues"] if i["scanner"] == "toxicity"]
-    assert len(toxic) == 1
-    assert toxic[0]["action"] == "allow"
-
-
 def test_canary_token_blocks(monkeypatch):
     monkeypatch.setenv("CANARY_TOKENS", "canary-azure-001, canary-sap-002")
 

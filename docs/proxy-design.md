@@ -9,7 +9,7 @@ Purpose:
 
 Components:
 - Guardrail Service (`guardrails_service/`)
-  - Runs LLM Guard scanners (prompt injection, toxicity, sensitive patterns) plus a regex credential-leak scanner (inputs and outputs) and exact-match canary tokens (`CANARY_TOKENS` env).
+  - Runs LLM Guard scanners (prompt injection, sensitive patterns) plus a regex credential-leak scanner (inputs and outputs) and exact-match canary tokens (`CANARY_TOKENS` env).
   - Exposes:
     - POST /check-input { text, agent_id?, user_id? } -> { ok, issues[] }
     - POST /check-output { text, agent_id?, user_id? } -> { ok, issues[] }
@@ -191,7 +191,12 @@ Decision: each scanner has an explicit action — `block`, `redact`, or
 |---|---|---|
 | credentials, sensitive_patterns (SSN/card/key shapes), canary, prompt_injection, jailbreak | block | High-confidence secrets or attacks: never leave infra |
 | pii (email, IPv4, phone) | redact | Low confidence, high false-positive surface; mask with `[REDACTED]` and let the call through |
-| toxicity | allow | Logged for review, not a policy boundary in v1 |
+
+(Toxicity scanning is disabled by default — DeBERTa-based toxicity scoring
+false-positives on aggressive-but-benign agent prompts and adds a model
+download + per-request inference for no threat coverage here. Re-enable via
+`InputToxicity` in guardrails_service/app.py if multi-user abuse detection
+is ever needed.)
 
 Contract: checks send `segments` (per-message input texts / output content
 plus tool-arg strings, parallel to what is scanned) alongside the joined
@@ -220,8 +225,7 @@ coding agent, a redacted email/IP in a user turn may degrade the answer.
 That trade is intentional: PII never reaches the upstream provider.
 
 Tests: `guardrails_service/test_app.py` (`test_check_output_pii_redaction`,
-`test_check_input_segments_redacted_per_segment`,
-`test_toxicity_issue_is_logged_not_blocking`); `proxy/test_app.py`
+`test_check_input_segments_redacted_per_segment`); `proxy/test_app.py`
 (`test_input_redaction_substituted_before_upstream`,
 `test_input_redaction_skipped_for_non_text_content_parts`,
 `test_output_redaction_substituted_into_response`,

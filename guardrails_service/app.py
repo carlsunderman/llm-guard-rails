@@ -3,7 +3,6 @@ Guardrail service for coding agents.
 
 Uses LLM Guard (v0.3.16) to scan prompts and responses for:
 - Prompt injection attempts (input)
-- Toxicity in prompts (input; logged only by default — see SCANNER_POLICY)
 - Sensitive patterns (secrets, SSN, credit cards) in outputs via regex (output)
 - Credential leaks (API keys, connection strings with embedded passwords,
   private keys, password assignments, canary tokens) in inputs and outputs
@@ -24,7 +23,7 @@ from fastapi import FastAPI
 from pydantic import BaseModel
 
 # LLM Guard imports (loaded once at startup in container)
-from llm_guard.input_scanners import PromptInjection, Toxicity as InputToxicity
+from llm_guard.input_scanners import PromptInjection
 from llm_guard.output_scanners import Regex as OutputRegex
 
 app = FastAPI(title="Agent Guardrails", version="0.1.0")
@@ -32,7 +31,11 @@ app = FastAPI(title="Agent Guardrails", version="0.1.0")
 
 # Input scanners
 prompt_injection_scanner = PromptInjection(threshold=0.85)
-toxicity_scanner = InputToxicity(threshold=0.6)
+# Toxicity scanning (llm_guard InputToxicity) is intentionally NOT enabled:
+# it adds a DeBERTa model download + per-request inference for a signal
+# that false-positives on benign-but-aggressive agent prompts, and this
+# deployment's threats are secrets/injection/PII, not abuse. Re-enable via
+# InputToxicity(threshold=0.6) + a "toxicity" SCANNER_POLICY entry if needed.
 
 # Output scanner: regex-based detection of high-confidence secrets and strong PII.
 # Deliberately excludes low-confidence patterns (emails, IPs, phone numbers):
@@ -87,10 +90,6 @@ pii_redaction_scanners = [
 ScannerAction = Literal["block", "redact", "allow"]
 SCANNER_POLICY: dict = {
     "prompt_injection": "block",
-    # Logged only by default: DeBERTa-style toxicity scoring false-positives
-    # on aggressive (but benign) agent prompts. Set to "block" to restore
-    # hard-blocking behavior.
-    "toxicity": "allow",
     "credentials": "block",
     "canary_token": "block",
     "sensitive_patterns": "block",
@@ -263,19 +262,6 @@ def run_input_scanners(text: str) -> List[Issue]:
                 severity=severity,
                 message=f"Possible prompt injection detected (score={score:.2f})",
                 action=SCANNER_POLICY["prompt_injection"],
-            )
-        )
-
-    # Toxicity in input (allow-action by default: logged, not blocking)
-    _, is_valid, score = toxicity_scanner.scan(text)
-    if not is_valid:
-        severity = "high" if score > 0.9 else "medium"
-        issues.append(
-            Issue(
-                scanner="toxicity",
-                severity=severity,
-                message=f"Toxic or abusive prompt detected (score={score:.2f})",
-                action=SCANNER_POLICY["toxicity"],
             )
         )
 
