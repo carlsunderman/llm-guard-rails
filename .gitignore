@@ -20,3 +20,5 @@ docs/issues/
 
 # Internal review doc - local only, never commit
 docs/review-2026-08-14.md
+# Potential enhancements / improvements - local scratch, never commit
+docs/enhancements.md
