@@ -4,6 +4,7 @@ Local guardrail service and proxy using LLM Guard to scan prompts and responses 
 - Prompt injection / jailbreak attempts (input)
 - Toxicity in prompts (input)
 - Sensitive patterns in outputs: API keys/tokens, SSNs, credit cards (output, regex-based; low-confidence PII like emails/IPs/phones is intentionally not blocking)
+- Credential leaks (input and output, incl. tool-call arguments): AWS keys, GitHub tokens, JWTs, PEM private keys, connection strings with embedded passwords, `password=`/`secret:` assignments, and exact-match canary tokens
 
 Designed to protect coding agents (Pi/OMP, Claude Code, Codex, etc.) via a centralized enforcement layer.
 
@@ -12,14 +13,14 @@ See `docs/proxy-design.md` for architecture and design decisions.
 ## Components
 
 - **Guardrail Service** (`guardrails_service/`)
-  - Runs LLM Guard scanners: prompt injection + toxicity (input), PII/secret regex (output).
+  - Runs LLM Guard scanners: prompt injection + toxicity (input), PII/secret regex + credential-leak regex + canary tokens (input and output).
   - Exposes `/check-input` and `/check-output`.
   - Port: 8090
 
 - **Proxy** (`proxy/`)
   - OpenAI-compatible HTTP proxy that enforces guardrails around every LLM call.
   - Sits between your tools and the upstream LLM provider.
-  - Input check covers system, user, and tool messages; output check covers the model response.
+  - Input check covers system, user, and tool messages; output check covers the model response including tool-call arguments (where exfiltration payloads to external systems appear).
   - Accepts OpenAI message content as a string, content-part list, or null.
   - Fail-closed by default if guardrails are unreachable.
   - Refuses to start if UPSTREAM_API_KEY is not set.
@@ -50,6 +51,7 @@ Optional overrides:
 - `UPSTREAM_MODEL` (default: gpt-4o)
 - `FAIL_CLOSED` (default: true; set to false for fail-open behavior)
 - `GUARDRAILS_TIMEOUT_SECONDS` (default: 3)
+- `CANARY_TOKENS` (guardrail service; comma-separated exact-match tokens to detect in prompts and outputs, e.g. seeded canary credentials)
 
 ### 2. Build and start services
 

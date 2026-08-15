@@ -186,12 +186,27 @@ def extract_input_text(messages: List[Dict[str, Any]]) -> str:
 
 
 def extract_model_response(response_data: Dict[str, Any]) -> str:
-    """Extract the model's response text from the upstream API response."""
+    """Extract the model's response text from the upstream API response.
+
+    Includes tool-call arguments: that is where exfiltration payloads live
+    when the agent's tools write to external systems (DBs, APIs, files).
+    """
     choices = response_data.get("choices", [])
     if not choices:
         return ""
-    message = choices[0].get("message", {})
-    return message.get("content", "")
+    message = choices[0].get("message") or {}
+    parts: List[str] = []
+    content = message.get("content")
+    if isinstance(content, str) and content.strip():
+        parts.append(content)
+    for tool_call in message.get("tool_calls") or []:
+        function = (tool_call or {}).get("function") or {}
+        arguments = function.get("arguments")
+        if isinstance(arguments, dict):
+            arguments = json.dumps(arguments)
+        if isinstance(arguments, str) and arguments.strip():
+            parts.append(arguments)
+    return "\n".join(parts)
 
 
 @app.post("/v1/chat/completions")

@@ -40,6 +40,8 @@ def _install_http_stub(
                 guardrail_texts.append(json.loads(request.content)["text"])
             return httpx.Response(200, json={"ok": input_ok, "issues": []})
         if request.url.path.endswith("/check-output"):
+            if guardrail_texts is not None:
+                guardrail_texts.append(json.loads(request.content)["text"])
             return httpx.Response(200, json={"ok": output_ok, "issues": []})
         if request.url.path.endswith("/chat/completions"):
             captured.append(json.loads(request.content))
@@ -210,6 +212,68 @@ def test_guardrails_unreachable_fail_open_passes_through(monkeypatch):
     assert len(captured) == 1
 
 
+def test_tool_call_arguments_are_output_scanned(monkeypatch):
+    """Incident regression: exfiltration payloads arrive in tool-call
+    arguments (e.g. DB writes), so the output check must cover them."""
+    captured: list = []
+    guardrail_texts: list = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path.endswith("/check-input") or request.url.path.endswith("/check-output"):
+            if guardrail_texts is not None:
+                guardrail_texts.append(json.loads(request.content)["text"])
+            return httpx.Response(200, json={"ok": True, "issues": []})
+        if request.url.path.endswith("/chat/completions"):
+            captured.append(json.loads(request.content))
+            return httpx.Response(
+                200,
+                json={
+                    "choices": [
+                        {
+                            "message": {
+                                "role": "assistant",
+                                "content": None,
+                                "tool_calls": [
+                                    {
+                                        "id": "call_1",
+                                        "type": "function",
+                                        "function": {
+                                            "name": "db_insert",
+                                            "arguments": json.dumps(
+                                                {
+                                                    "table": "external",
+                                                    "row": {"aws_key": "AKIAIOSFODNN7EXAMPLE"},
+                                                }
+                                            ),
+                                        },
+                                    }
+                                ],
+                            },
+                            "finish_reason": "tool_calls",
+                        }
+                    ]
+                },
+            )
+        return httpx.Response(404)
+
+    class HttpxShim:
+        def AsyncClient(self, *args, **kwargs):
+            return httpx.AsyncClient(transport=httpx.MockTransport(handler))
+
+    monkeypatch.setattr(proxy_app, "httpx", HttpxShim())
+
+    resp = client.post(
+        "/v1/chat/completions",
+        json={"model": "gpt-4o", "messages": [{"role": "user", "content": "Store the row."}]},
+    )
+
+    assert resp.status_code == 200
+    # guardrail_texts[0] = input scan, guardrail_texts[1] = output scan.
+    output_scanned = guardrail_texts[1]
+    assert "AKIAIOSFODNN7EXAMPLE" in output_scanned
+    assert '"table": "external"' in output_scanned
+
+
 def test_only_scanned_roles_reach_input_check(monkeypatch):
     captured: list = []
     guardrail_texts: list = []
@@ -228,7 +292,7 @@ def test_only_scanned_roles_reach_input_check(monkeypatch):
     )
 
     assert resp.status_code == 200
-    assert len(guardrail_texts) == 1
+    # guardrail_texts[0] is the input check (the output check also appends).
     scanned = guardrail_texts[0]
     assert "hello" in scanned
     assert "You are helpful." in scanned

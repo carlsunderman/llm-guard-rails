@@ -5,11 +5,14 @@ Uses LLM Guard (v0.3.16) to scan prompts and responses for:
 - Prompt injection attempts (input)
 - Toxicity in prompts (input)
 - Sensitive patterns (secrets, SSN, credit cards) in outputs via regex (output)
+- Credential leaks (API keys, connection strings with embedded passwords,
+  private keys, password assignments, canary tokens) in inputs and outputs
 
 Run via Docker Compose; exposes HTTP endpoints on port 8090.
 """
 
 import os
+import re
 from typing import List, Literal, Optional
 
 from fastapi import FastAPI
@@ -56,17 +59,96 @@ redact_candidate_patterns = [
 
 sensitive_pattern_scanner = OutputRegex(patterns=blocking_pii_patterns, is_blocked=True, redact=False)
 
+# Credential-leak scanner (regex, no ML). Runs on BOTH inputs and outputs:
+# input hits stop credentials from ever entering model context, output hits
+# stop exfiltration (including tool-call arguments, which the proxy scans).
+# Covers AWS, GitHub, JWTs, PEM private keys, generic connection strings
+# with embedded user:pass (mongodb, postgres, mssql, hana/SAP, redis, ...),
+# and named secret assignments (password=..., secret: ...).
+CREDENTIAL_PATTERNS: List[tuple] = [
+    ("aws_access_key_id", r"\bAKIA[0-9A-Z]{16}\b"),
+    ("aws_temp_access_key_id", r"\bASIA[0-9A-Z]{16}\b"),
+    ("github_token", r"\bgh[opsur]_[A-Za-z0-9]{36,}\b"),
+    ("github_fine_grained_token", r"\bgithub_pat_[A-Za-z0-9_]{22,}\b"),
+    ("jwt", r"\beyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}"),
+    ("pem_private_key", r"-----BEGIN [A-Z0-9 ]*PRIVATE KEY(?: BLOCK)?-----"),
+    # scheme://user:pass@ — any URL with embedded basic-auth credentials
+    ("connection_string_credentials", r"\b[a-zA-Z][a-zA-Z0-9+.-]*://[^/\s:@]+:[^/\s@]+@"),
+    # password= / secret: style assignments; value captured for placeholder check
+    (
+        "named_secret_assignment",
+        r"(?i)\b(?:password|passwd|pwd|passphrase|secret|client_secret|access_key"
+        r"|secret_key|api_key|apikey|auth_token|access_token)\s*[:=]\s*['\"]?"
+        r"([A-Za-z0-9!@#$%^&*_,./+~-]{8,})",
+    ),
+]
 
-class CheckRequest(BaseModel):
-    text: str
-    agent_id: Optional[str] = None
-    user_id: Optional[str] = None
+# Values that are clearly not real secrets (templates, type annotations,
+# prose). Checked against the captured assignment value only.
+PLACEHOLDER_MARKERS = ("${", "{{", "<", ">", "%s", "{0}")
+PLACEHOLDER_VALUES = {
+    "none", "null", "nil", "undefined", "true", "false", "string", "str",
+    "text", "value", "values", "parameter", "parameters", "param",
+    "placeholder", "example", "changeme", "change_me", "your", "xxx",
+    "xxxx", "dummy", "test", "password", "passwd", "secret", "token",
+    "todo", "fixme", "redacted",
+}
 
 
 class Issue(BaseModel):
     scanner: str
     severity: Literal["low", "medium", "high", "critical"]
     message: str
+
+
+def _is_placeholder(value: str) -> bool:
+    v = value.strip("'\"").lower()
+    if any(marker in v for marker in PLACEHOLDER_MARKERS):
+        return True
+    return v in PLACEHOLDER_VALUES
+
+
+def _load_canary_tokens() -> List[str]:
+    """Exact-match canary tokens from CANARY_TOKENS (comma-separated env)."""
+    raw = os.getenv("CANARY_TOKENS", "")
+    return [t.strip() for t in raw.split(",") if t.strip()]
+
+
+def run_credential_scanners(text: str) -> List[Issue]:
+    """Regex-based credential leak detection. Never echoes matched values."""
+    issues: List[Issue] = []
+    seen: set = set()
+    for name, pattern in CREDENTIAL_PATTERNS:
+        for match in re.finditer(pattern, text):
+            if name == "named_secret_assignment" and _is_placeholder(match.group(1)):
+                continue
+            if name in seen:
+                continue
+            seen.add(name)
+            issues.append(
+                Issue(
+                    scanner="credentials",
+                    severity="high",
+                    message=f"Possible credential leak ({name})",
+                )
+            )
+    for token in _load_canary_tokens():
+        if token in text:
+            issues.append(
+                Issue(
+                    scanner="canary_token",
+                    severity="critical",
+                    message="Canary token detected",
+                )
+            )
+            break
+    return issues
+
+
+class CheckRequest(BaseModel):
+    text: str
+    agent_id: Optional[str] = None
+    user_id: Optional[str] = None
 
 
 class CheckResponse(BaseModel):
@@ -134,7 +216,7 @@ def check_input(req: CheckRequest):
     if not req.text.strip():
         return CheckResponse(ok=True)
 
-    issues = run_input_scanners(req.text)
+    issues = run_input_scanners(req.text) + run_credential_scanners(req.text)
     return CheckResponse(ok=len(issues) == 0, issues=issues)
 
 
@@ -149,7 +231,7 @@ def check_output(req: CheckRequest):
     if not req.text.strip():
         return CheckResponse(ok=True)
 
-    issues = run_output_scanners("", req.text)
+    issues = run_output_scanners("", req.text) + run_credential_scanners(req.text)
     return CheckResponse(ok=len(issues) == 0, issues=issues)
 
 

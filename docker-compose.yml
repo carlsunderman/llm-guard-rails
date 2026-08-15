@@ -9,6 +9,8 @@ services:
     environment:
       - HOST=0.0.0.0
       - PORT=8090
+      # Comma-separated exact-match canary tokens to detect in inputs/outputs
+      - CANARY_TOKENS=${CANARY_TOKENS:-}
     restart: unless-stopped
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:8090/health"]

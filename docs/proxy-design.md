@@ -9,7 +9,7 @@ Purpose:
 
 Components:
 - Guardrail Service (`guardrails_service/`)
-  - Runs LLM Guard scanners (prompt injection, toxicity, sensitive patterns).
+  - Runs LLM Guard scanners (prompt injection, toxicity, sensitive patterns) plus a regex credential-leak scanner (inputs and outputs) and exact-match canary tokens (`CANARY_TOKENS` env).
   - Exposes:
     - POST /check-input { text, agent_id?, user_id? } -> { ok, issues[] }
     - POST /check-output { text, agent_id?, user_id? } -> { ok, issues[] }
@@ -22,7 +22,7 @@ Components:
     1. Extracts the input text (system, user, and tool messages) and metadata.
     2. Calls guardrail service /check-input.
     3. If allowed, forwards request to the upstream LLM provider (OpenAI-compatible).
-    4. Calls guardrail service /check-output on the model response.
+    4. Calls guardrail service /check-output on the model response, including tool-call arguments (where exfiltration payloads to external systems appear).
     5. Returns the upstream response to the client, or blocks with an error if either check fails.
   - Logs every decision as structured JSON for auditing.
 
@@ -136,6 +136,24 @@ Investigated 2026-08-15 (review doc, item 7). No code change.
 - A lone SSN-shaped reference in normal prose (`Reference number 123-45-6789`) passes at ~0.01; it is the *repetition request* combined with the sensitive data that trips it.
 - Future mitigation options if this becomes operationally noisy: per-policy severity rules (see above) or substituting a different injection scanner. Recorded in `docs/review-2026-08-14.md`.
 
+### 7. Credential-leak scanner (added 2026-08-15, incident-driven)
+
+Incident context: a model was asked to chunk a credentials file and the chunks were written to an external-facing database. The exfiltration vector was the **tool-call arguments** in the model response, which the output check originally did not inspect.
+
+Changes:
+- The proxy output check now scans `choices[].message.tool_calls[].function.arguments` in addition to `content` (see `extract_model_response`).
+- The guardrail service runs `run_credential_scanners` on **both** `/check-input` and `/check-output` (input hits stop credentials from ever entering model context; output hits stop exfiltration). Coverage:
+  - AWS access keys (`AKIA...`, `ASIA...`), GitHub tokens (`gh[opsur]_...`, `github_pat_...`), JWTs (`eyJ...`), PEM private-key blocks.
+  - Any URL with embedded basic-auth credentials (`scheme://user:pass@...`), which covers MongoDB, SQL Server (`mssql://`), Postgres, SAP HANA (`hana://`), Azure, Redis, etc.
+  - Named secret assignments (`password=...`, `secret: ...`, `api_key=...`, `access_token=...`, ...) with a placeholder filter so env indirection (`${DB_PASSWORD}`), angle-bracket placeholders, type annotations, and prose don't block.
+  - Exact-match **canary tokens** from `CANARY_TOKENS` (comma-separated env var, severity `critical`). Recommended: seed canaries into the systems most likely to leak and verify detection end-to-end.
+
+Known limits (honest scope):
+- Unstructured plaintext credential dumps (bare `user123  hunter22` lines with no key/URL structure) are **not** detectable by regex; that needs a classifier or a known-value list (e.g. sync real usernames and match against them).
+- Protection covers the LLM API path only. Tool executions that never traverse the model (direct file writes, direct HTTP) are out of scope; extend the Claude Code hook or add egress-side detection for those.
+- Streaming responses (`"stream": true`) are not output-checked: the proxy's response parsing fails and the request errors (fail-closed, nothing leaks), but there is no streamed-inspection path yet.
+- Matched values are never echoed into issues or logs.
+
 ## Deployment
 
 POC (local):
@@ -157,7 +175,8 @@ Org-wide (future):
 - Credit-card output pattern requires grouped 4-digit separators so long contiguous numeric ids (transaction numbers, build ids) no longer trigger false-positive blocks.
 - Proxy fails fast at startup if UPSTREAM_API_KEY is unset; upstream/guardrail error details are logged to stderr, never returned to clients.
 - Verified end-to-end (2026-08-15, against a local OpenAI-compatible mock upstream): benign prompt returned the upstream response (200); model output containing an SSN blocked post-upstream (400, sensitive_patterns); injection prompt blocked pre-upstream (400, prompt_injection). Pure-JSON audit lines written for all three paths with the derived `upstream_provider`.
-- Not yet implemented: redaction, Anthropic-format route, tenant/user policy scoping, auth on the proxy, Kubernetes manifests.
+- Credential-leak protection added 2026-08-15 (incident-driven): output check covers tool-call arguments; regex credential scanner + `CANARY_TOKENS` exact-match canaries run on inputs and outputs (see section 7).
+- Not yet implemented: redaction, streaming-response inspection, Anthropic-format route, tenant/user policy scoping, auth on the proxy, Kubernetes manifests.
 
 ## Known issues (from 2026-08-14 review, see `docs/review-2026-08-14.md`)
 
