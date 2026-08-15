@@ -9,7 +9,7 @@ Purpose:
 
 Components:
 - Guardrail Service (`guardrails_service/`)
-  - Runs LLM Guard scanners (prompt injection, sensitive patterns) plus a regex credential-leak scanner (inputs and outputs) and exact-match canary tokens (`CANARY_TOKENS` env).
+  - Runs LLM Guard scanners (prompt injection, invisible-text sanitization, sensitive patterns) plus a regex credential-leak scanner (inputs and outputs) and exact-match canary tokens (`CANARY_TOKENS` env).
   - Exposes:
     - POST /check-input { text, agent_id?, user_id? } -> { ok, issues[] }
     - POST /check-output { text, agent_id?, user_id? } -> { ok, issues[] }
@@ -191,6 +191,7 @@ Decision: each scanner has an explicit action — `block`, `redact`, or
 |---|---|---|
 | credentials, sensitive_patterns (SSN/card/key shapes), canary, prompt_injection, jailbreak | block | High-confidence secrets or attacks: never leave infra |
 | pii (email, IPv4, phone) | redact | Low confidence, high false-positive surface; mask with `[REDACTED]` and let the call through |
+| invisible_text (BOM, zero-width, bidi controls; inputs only) | redact | Strips the characters (lossless for the model — tokenizers drop them) and unmasks invisible-character injection payloads |
 
 (Toxicity scanning is disabled by default — DeBERTa-based toxicity scoring
 false-positives on aggressive-but-benign agent prompts and adds a model

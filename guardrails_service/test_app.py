@@ -205,6 +205,68 @@ def test_check_input_segments_redacted_per_segment():
     ]
 
 
+def test_invisible_text_sanitized_on_input():
+    # BOM + zero-width space + bidi control: all stripped, request passes.
+    resp = client.post(
+        "/check-input",
+        json={"text": "\ufeffplease continue\u200b with the refactor\u202e"},
+    )
+
+    assert resp.status_code == 200
+    data = resp.json()
+    assert data["ok"] is True
+    inv = [i for i in data["issues"] if i["scanner"] == "invisible_text"]
+    assert len(inv) == 1
+    assert inv[0]["action"] == "redact"
+    assert data["redacted"] is not None
+    cleaned = data["redacted"][0]
+    assert "\ufeff" not in cleaned
+    assert "\u200b" not in cleaned
+    assert "\u202e" not in cleaned
+    assert cleaned == "please continue with the refactor"
+
+
+def test_invisible_text_not_sanitized_on_output():
+    # Input-side attack vector only: outputs are untouched.
+    resp = client.post("/check-output", json={"text": "result\ufeff done"})
+
+    assert resp.status_code == 200
+    data = resp.json()
+    assert data["ok"] is True
+    assert data["redacted"] is None
+    assert not [i for i in data["issues"] if i["scanner"] == "invisible_text"]
+
+
+def test_openai_project_key_blocks():
+    resp = client.post(
+        "/check-input",
+        json={"text": "deploy with sk-proj-AbCdEfGhIjKlMnOpQrStUvWx012345"},
+    )
+
+    assert resp.status_code == 200
+    data = resp.json()
+    assert data["ok"] is False
+    assert any(
+        i["scanner"] == "credentials" and "openai_project_key" in i["message"]
+        for i in data["issues"]
+    )
+
+
+def test_gcp_api_key_blocks():
+    resp = client.post(
+        "/check-output",
+        json={"text": "key is AIzaSyA1b2C3d4E5f6G7h8I9j0K1l2M3n4O5p6Q7r"},
+    )
+
+    assert resp.status_code == 200
+    data = resp.json()
+    assert data["ok"] is False
+    assert any(
+        i["scanner"] == "credentials" and "gcp_api_key" in i["message"]
+        for i in data["issues"]
+    )
+
+
 def test_canary_token_blocks(monkeypatch):
     monkeypatch.setenv("CANARY_TOKENS", "canary-azure-001, canary-sap-002")
 

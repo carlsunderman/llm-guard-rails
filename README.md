@@ -2,8 +2,9 @@
 
 Local guardrail service and proxy using LLM Guard to scan prompts and responses for:
 - Prompt injection / jailbreak attempts (input)
+- Invisible-character payloads (BOM, zero-width, bidi controls) in inputs — sanitized out (redact)
 - Sensitive patterns in outputs: API keys/tokens, SSNs, credit cards (output, regex-based)
-- Per-scanner policy: credential-shaped patterns, prompt injection, and canaries **block**; low-confidence PII (emails, IPv4, phone numbers) is **redacted in place** (`[REDACTED]`) and let through
+- Per-scanner policy: credential-shaped patterns, prompt injection, and canaries **block**; low-confidence PII (emails, IPv4, phone numbers) is **redacted in place** (`[REDACTED]`) and invisible characters are **stripped** (redacted) — both let through
 - Credential leaks (input and output, incl. tool-call arguments): AWS keys, GitHub tokens, JWTs, PEM private keys, connection strings with embedded passwords, `password=`/`secret:` assignments, and exact-match canary tokens
 
 Designed to protect coding agents (Pi/OMP, Claude Code, Codex, Hermes, OpenClaw, etc.) via a centralized enforcement layer.
@@ -13,7 +14,7 @@ See `docs/proxy-design.md` for architecture and design decisions.
 ## Components
 
 - **Guardrail Service** (`guardrails_service/`)
-  - Runs LLM Guard scanners: prompt injection (input), PII/secret regex + credential-leak regex + canary tokens (input and output).
+  - Runs LLM Guard scanners: prompt injection + invisible-text sanitization (input), PII/secret regex + credential-leak regex + canary tokens (input and output).
   - Exposes `/check-input` and `/check-output`.
   - Port: 8090
 

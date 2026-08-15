@@ -23,7 +23,7 @@ from fastapi import FastAPI
 from pydantic import BaseModel
 
 # LLM Guard imports (loaded once at startup in container)
-from llm_guard.input_scanners import PromptInjection
+from llm_guard.input_scanners import InvisibleText, PromptInjection
 from llm_guard.output_scanners import Regex as OutputRegex
 
 app = FastAPI(title="Agent Guardrails", version="0.1.0")
@@ -31,6 +31,12 @@ app = FastAPI(title="Agent Guardrails", version="0.1.0")
 
 # Input scanners
 prompt_injection_scanner = PromptInjection(threshold=0.85)
+# Invisible-text sanitizer: strips Unicode format/private-use/unassigned
+# characters (BOM, zero-width, bidi controls) that carry invisible-character
+# injection payloads. scan() returns the cleaned text, so this is a redact
+# scanner (see SCANNER_POLICY); inputs only, since it's an input-side
+# attack vector.
+invisible_text_scanner = InvisibleText()
 # Toxicity scanning (llm_guard InputToxicity) is intentionally NOT enabled:
 # it adds a DeBERTa model download + per-request inference for a signal
 # that false-positives on benign-but-aggressive agent prompts, and this
@@ -94,6 +100,7 @@ SCANNER_POLICY: dict = {
     "canary_token": "block",
     "sensitive_patterns": "block",
     "pii": "redact",
+    "invisible_text": "redact",
 }
 
 # Credential-leak scanner (regex, no ML). Runs on BOTH inputs and outputs:
@@ -109,6 +116,10 @@ CREDENTIAL_PATTERNS: List[tuple] = [
     ("github_fine_grained_token", r"\bgithub_pat_[A-Za-z0-9_]{22,}\b"),
     # Databricks personal access token (dapi + 44 alphanumerics)
     ("databricks_pat", r"\bdapi[a-zA-Z0-9]{44}\b"),
+    # OpenAI project API key
+    ("openai_project_key", r"\bsk-proj-[A-Za-z0-9_-]{20,}"),
+    # GCP API key (AIza + 35 base64url chars)
+    ("gcp_api_key", r"\bAIza[0-9A-Za-z_-]{35}"),
     ("jwt", r"\beyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}"),
     ("pem_private_key", r"-----BEGIN [A-Z0-9 ]*PRIVATE KEY(?: BLOCK)?-----"),
     # scheme://user:pass@ — any URL with embedded basic-auth credentials
@@ -248,6 +259,35 @@ def run_pii_redaction(segments: List[str]) -> tuple:
     return (redacted if hits else None), issues
 
 
+def run_invisible_text_sanitization(segments: List[str]) -> tuple:
+    """Strip invisible characters per segment (input path only).
+
+    Like run_pii_redaction, returns (redacted_segments_or_None, issues):
+    the list is parallel to `segments` and None when no segment changed.
+    Stripping is lossless for the model (tokenizers drop these characters
+    anyway) and unmasks invisible-character injection payloads, making the
+    hidden instructions visible to the user and the injection scanner.
+    """
+    redacted: List[str] = []
+    hits = 0
+    for segment in segments:
+        text, is_valid, _ = invisible_text_scanner.scan(segment)
+        if not is_valid:
+            hits += 1
+        redacted.append(text)
+    issues: List[Issue] = []
+    if hits:
+        issues.append(
+            Issue(
+                scanner="invisible_text",
+                severity="medium",
+                message=f"Invisible characters found in {hits} segment(s); removed",
+                action=SCANNER_POLICY["invisible_text"],
+            )
+        )
+    return (redacted if hits else None), issues
+
+
 def run_input_scanners(text: str) -> List[Issue]:
     """Run input scanners using llm-guard 0.3.x API: scan(prompt) -> (text, is_valid, score)."""
     issues: List[Issue] = []
@@ -307,8 +347,15 @@ def check_input(req: CheckRequest):
 
     issues = run_input_scanners(text) + run_credential_scanners(text)
     redacted, pii_issues = run_pii_redaction(segments)
-    issues = issues + pii_issues
-    return CheckResponse(ok=_decide(issues), issues=issues, redacted=redacted)
+    # Invisible-text sanitization runs on top of the PII-redacted text; when
+    # it changes anything its output already includes the PII redaction.
+    sanitized, invisible_issues = run_invisible_text_sanitization(
+        redacted or segments
+    )
+    issues = issues + pii_issues + invisible_issues
+    return CheckResponse(
+        ok=_decide(issues), issues=issues, redacted=sanitized or redacted
+    )
 
 
 @app.post("/check-output", response_model=CheckResponse)
