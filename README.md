@@ -40,7 +40,13 @@ See `docs/proxy-design.md` for architecture and design decisions.
 
 ### 1. Configure the environment
 
-Put all configuration and secrets in the project-root `.env` file (gitignored; a template is included). Docker Compose reads it automatically for `${VAR}` substitution — no shell exports needed.
+Put all configuration and secrets in the project-root `.env` file (gitignored). Start from the template:
+
+```bash
+cp .env.example .env
+```
+
+Docker Compose reads `.env` automatically for `${VAR}` substitution — no shell exports needed.
 
 Required: set your upstream API key:
 
