@@ -134,7 +134,7 @@ Investigated 2026-08-15 (review doc, item 7). No code change.
 - Its score is **bimodal and saturated**: ~1.0 for any text it flags, ~0.0-0.05 otherwise. There is no usable probability band, so threshold tuning cannot trade precision for recall (and vice versa).
 - It treats **verbatim-repetition / "echo this string" requests as injection** (e.g. `REPEAT: ...`, `Please echo this exact string: ...`). This is deliberate in the model, not a bug: asking a model to replay sensitive context verbatim is a known exfiltration / indirect-injection payload. Do not paper over it with a length-based skip or a pattern exception — that re-opens a real attack surface.
 - A lone SSN-shaped reference in normal prose (`Reference number 123-45-6789`) passes at ~0.01; it is the *repetition request* combined with the sensitive data that trips it.
-- Future mitigation options if this becomes operationally noisy: per-policy severity rules (see above) or substituting a different injection scanner. Recorded in `docs/review-2026-08-14.md`.
+- Future mitigation options if this becomes operationally noisy: per-policy severity rules (see above) or substituting a different injection scanner.
 
 ### 7. Credential-leak scanner (added 2026-08-15, incident-driven)
 
@@ -178,7 +178,7 @@ Org-wide (future):
 - Credential-leak protection added 2026-08-15 (incident-driven): output check covers tool-call arguments; regex credential scanner + `CANARY_TOKENS` exact-match canaries run on inputs and outputs (see section 7).
 - Not yet implemented: redaction, streaming-response inspection, Anthropic-format route, tenant/user policy scoping, auth on the proxy, Kubernetes manifests.
 
-## Known issues (from 2026-08-14 review, see `docs/review-2026-08-14.md`)
+## Known issues (from 2026-08-14 review)
 
 - **[P0, resolved 31a8186]** The proxy now forwards the raw request body verbatim (minus `agent_id`/`user_id`), so `tools`, `tool_choice`, `stream`, `response_format`, etc. reach upstream untouched. Covered by `proxy/test_app.py`.
 - **[P1, resolved]** The output block list is now high-confidence only (SSN, grouped credit cards, API-key/token shapes). Email/phone/IPv4 moved to `redact_candidate_patterns` (non-blocking, reserved for the future redact-only mode).

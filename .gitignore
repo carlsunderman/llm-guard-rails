@@ -17,3 +17,6 @@ Thumbs.db
 docs/planning/
 docs/tasks/
 docs/issues/
+
+# Internal review doc - local only, never commit
+docs/review-2026-08-14.md
