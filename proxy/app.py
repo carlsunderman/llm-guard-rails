@@ -449,6 +449,25 @@ async def chat_completions(request: Request):
             )
             upstream_resp.raise_for_status()
             response_data = upstream_resp.json()
+    except httpx.HTTPStatusError as e:
+        # Surface the upstream status code (429, 500, ...); the response
+        # body stays on stderr only.
+        logger.exception("Upstream LLM call failed (model=%s)", model)
+        write_audit_log(
+            request_id=request_id,
+            agent_id=agent_id,
+            user_id=user_id,
+            input_decision=input_decision,
+            input_issues=input_issues,
+            output_decision="error",
+            output_issues=[],
+            overall_decision="error",
+            start_time=start_time,
+        )
+        raise HTTPException(
+            status_code=502,
+            detail=f"Upstream LLM error (upstream status {e.response.status_code})",
+        )
     except Exception:
         logger.exception("Upstream LLM call failed (model=%s)", model)
         write_audit_log(
@@ -514,12 +533,7 @@ async def chat_completions(request: Request):
 
     # Step 4: Return allowed response. Streaming clients receive the checked
     # response replayed as an SSE stream; the block above still fires before
-    # any bytes reach them.
-    if raw.get("stream"):
-        return StreamingResponse(
-            iter(build_sse_events(response_data, model)),
-            media_type="text/event-stream",
-        )
+    # any bytes reach them. Audit first so both paths are logged.
     write_audit_log(
         request_id=request_id,
         agent_id=agent_id,
@@ -531,6 +545,11 @@ async def chat_completions(request: Request):
         overall_decision="allow",
         start_time=start_time,
     )
+    if raw.get("stream"):
+        return StreamingResponse(
+            iter(build_sse_events(response_data, model)),
+            media_type="text/event-stream",
+        )
 
     return response_data
 

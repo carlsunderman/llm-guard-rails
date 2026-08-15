@@ -32,6 +32,7 @@ def _install_http_stub(
     upstream_content="hello",
     guardrail_texts=None,
     upstream_response=None,
+    upstream_status=200,
     input_redacted=None,
     output_redacted=None,
 ):
@@ -55,10 +56,13 @@ def _install_http_stub(
             body = upstream_response or {
                 "choices": [{"message": {"role": "assistant", "content": upstream_content}}]
             }
-            return httpx.Response(200, json=body)
+            return httpx.Response(upstream_status, json=body)
         return httpx.Response(404)
 
     class HttpxShim:
+        # The proxy catches httpx.HTTPStatusError; expose it on the shim.
+        HTTPStatusError = httpx.HTTPStatusError
+
         def AsyncClient(self, *args, **kwargs):
             return httpx.AsyncClient(transport=httpx.MockTransport(handler))
 
@@ -320,7 +324,7 @@ def test_allow_path_returns_upstream_response_verbatim(monkeypatch):
     assert resp.json() == {"choices": [{"message": {"role": "assistant", "content": "42"}}]}
     assert len(captured) == 1
 
-def test_streaming_request_replays_sse_after_output_check(monkeypatch):
+def test_streaming_request_replays_sse_after_output_check(monkeypatch, capsys):
     captured: list = []
     guardrail_texts: list = []
     _install_http_stub(
@@ -350,6 +354,37 @@ def test_streaming_request_replays_sse_after_output_check(monkeypatch):
     assert "Streamed answer." in body
     assert '"finish_reason": "stop"' in body
     assert body.rstrip().endswith("data: [DONE]")
+    # Streaming requests must be audited too (regression: the audit write
+    # used to sit after the early StreamingResponse return).
+    audit_lines = [
+        json.loads(line)
+        for line in capsys.readouterr().out.splitlines()
+        if line.strip().startswith("{")
+    ]
+    assert len(audit_lines) == 1
+    assert audit_lines[0]["overall_decision"] == "allow"
+
+
+def test_upstream_429_surfaces_status_in_502(monkeypatch, capsys):
+    captured: list = []
+    _install_http_stub(monkeypatch, captured, upstream_status=429)
+
+    resp = client.post(
+        "/v1/chat/completions",
+        json={"messages": [{"role": "user", "content": "Hi"}]},
+    )
+
+    assert resp.status_code == 502
+    assert "429" in resp.json()["detail"]
+    assert len(captured) == 1
+    # Audited as an error, not an allow.
+    audit_lines = [
+        json.loads(line)
+        for line in capsys.readouterr().out.splitlines()
+        if line.strip().startswith("{")
+    ]
+    assert len(audit_lines) == 1
+    assert audit_lines[0]["overall_decision"] == "error"
 
 
 def test_streaming_tool_calls_replayed_as_sse(monkeypatch):

@@ -256,6 +256,8 @@ Org-wide (future):
 - Verified end-to-end (2026-08-15, against a local OpenAI-compatible mock upstream): benign prompt returned the upstream response (200); model output containing an SSN blocked post-upstream (400, sensitive_patterns); injection prompt blocked pre-upstream (400, prompt_injection). Pure-JSON audit lines written for all three paths with the derived `upstream_provider`.
 - Credential-leak protection added 2026-08-15 (incident-driven): output check covers tool-call arguments; regex credential scanner + `CANARY_TOKENS` exact-match canaries run on inputs and outputs (see section 7).
 - PII redaction added 2026-08-15: per-scanner `block|redact|allow` policy; low-confidence PII (email/IPv4/phone) masked with `[REDACTED]` in inputs (pre-upstream) and assistant content (pre-client, incl. SSE replay); tool-call arguments scanned but not redacted in v1 (see section 8).
+- Invisible-text sanitization added 2026-08-15 (input path, action `redact`); OpenAI `sk-proj-` and GCP `AIza` patterns added to the credential scanner.
+- Fixed 2026-08-15: streaming requests skipped the audit log (audit write sat after the early `StreamingResponse` return); audit is now written on every path. Upstream LLM errors surface the upstream status code in the 502 detail (`Upstream LLM error (upstream status 429)`); bodies stay on stderr only.
 - Not yet implemented: YAML policy config, Anthropic-format route (needed for native Claude Code), tenant/user policy scoping, auth on the proxy, Kubernetes manifests.
 
 ## Known issues (from 2026-08-14 review)
