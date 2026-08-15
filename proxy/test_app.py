@@ -25,12 +25,20 @@ import app as proxy_app
 client = TestClient(proxy_app.app)
 
 
-def _install_http_stub(monkeypatch, captured, guardrail_ok=True, upstream_content="hello"):
+def _install_http_stub(
+    monkeypatch,
+    captured,
+    input_ok=True,
+    output_ok=True,
+    upstream_content="hello",
+):
     """Route the proxy's outbound httpx calls to a MockTransport."""
 
     def handler(request: httpx.Request) -> httpx.Response:
-        if request.url.path.endswith("/check-input") or request.url.path.endswith("/check-output"):
-            return httpx.Response(200, json={"ok": guardrail_ok, "issues": []})
+        if request.url.path.endswith("/check-input"):
+            return httpx.Response(200, json={"ok": input_ok, "issues": []})
+        if request.url.path.endswith("/check-output"):
+            return httpx.Response(200, json={"ok": output_ok, "issues": []})
         if request.url.path.endswith("/chat/completions"):
             captured.append(json.loads(request.content))
             return httpx.Response(
@@ -121,9 +129,28 @@ def test_null_message_content_and_tool_calls_forwarded_verbatim(monkeypatch):
     assert captured[0]["messages"] == messages
 
 
+def _install_guardrails_down_stub(monkeypatch, captured):
+    """Upstream works, but the guardrail service is unreachable."""
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path.endswith("/chat/completions"):
+            captured.append(json.loads(request.content))
+            return httpx.Response(
+                200,
+                json={"choices": [{"message": {"role": "assistant", "content": "hello"}}]},
+            )
+        raise httpx.ConnectError("guardrails down")
+
+    class HttpxShim:
+        def AsyncClient(self, *args, **kwargs):
+            return httpx.AsyncClient(transport=httpx.MockTransport(handler))
+
+    monkeypatch.setattr(proxy_app, "httpx", HttpxShim())
+
+
 def test_input_block_returns_400_and_skips_upstream(monkeypatch):
     captured: list = []
-    _install_http_stub(monkeypatch, captured, guardrail_ok=False)
+    _install_http_stub(monkeypatch, captured, input_ok=False)
 
     resp = client.post(
         "/v1/chat/completions",
@@ -133,3 +160,63 @@ def test_input_block_returns_400_and_skips_upstream(monkeypatch):
     assert resp.status_code == 400
     assert "blocked by guardrails" in resp.json()["detail"]
     assert captured == []
+
+
+def test_output_block_returns_400_after_upstream_call(monkeypatch):
+    captured: list = []
+    _install_http_stub(
+        monkeypatch, captured, output_ok=False, upstream_content="SSN 123-45-6789"
+    )
+
+    resp = client.post(
+        "/v1/chat/completions",
+        json={"messages": [{"role": "user", "content": "Show me the record."}]},
+    )
+
+    assert resp.status_code == 400
+    assert "Response blocked" in resp.json()["detail"]
+    # Upstream was called (output check happens after the LLM call).
+    assert len(captured) == 1
+
+
+def test_guardrails_unreachable_fail_closed_returns_503(monkeypatch):
+    captured: list = []
+    _install_guardrails_down_stub(monkeypatch, captured)
+    monkeypatch.setattr(proxy_app, "FAIL_CLOSED", True)
+
+    resp = client.post(
+        "/v1/chat/completions",
+        json={"messages": [{"role": "user", "content": "Hi"}]},
+    )
+
+    assert resp.status_code == 503
+    assert "fail-closed" in resp.json()["detail"]
+    assert captured == []
+
+
+def test_guardrails_unreachable_fail_open_passes_through(monkeypatch):
+    captured: list = []
+    _install_guardrails_down_stub(monkeypatch, captured)
+    monkeypatch.setattr(proxy_app, "FAIL_CLOSED", False)
+
+    resp = client.post(
+        "/v1/chat/completions",
+        json={"messages": [{"role": "user", "content": "Hi"}]},
+    )
+
+    assert resp.status_code == 200
+    assert len(captured) == 1
+
+
+def test_allow_path_returns_upstream_response_verbatim(monkeypatch):
+    captured: list = []
+    _install_http_stub(monkeypatch, captured, upstream_content="42")
+
+    resp = client.post(
+        "/v1/chat/completions",
+        json={"model": "gpt-4o", "messages": [{"role": "user", "content": "The answer?"}]},
+    )
+
+    assert resp.status_code == 200
+    assert resp.json() == {"choices": [{"message": {"role": "assistant", "content": "42"}}]}
+    assert len(captured) == 1

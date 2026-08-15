@@ -152,6 +152,5 @@ Org-wide (future):
 
 - **[P0, resolved 31a8186]** The proxy now forwards the raw request body verbatim (minus `agent_id`/`user_id`), so `tools`, `tool_choice`, `stream`, `response_format`, etc. reach upstream untouched. Covered by `proxy/test_app.py`.
 - **[P1, resolved]** The output block list is now high-confidence only (SSN, grouped credit cards, API-key/token shapes). Email/phone/IPv4 moved to `redact_candidate_patterns` (non-blocking, reserved for the future redact-only mode).
-- **[P1]** The proxy has no test coverage.
-- **[P1]** Remaining proxy test coverage: output-block path, fail-closed 503, fail-open passthrough, full allow-path passthrough (field-forwarding and input-block tests already exist in `proxy/test_app.py`).
+- **[P1, resolved]** `proxy/test_app.py` covers field forwarding, model default, null-content/tool_calls verbatim forwarding, input block, output block, fail-closed 503, fail-open passthrough, and allow-path passthrough (mocked upstream + guardrails).
 - **[P3]** `extract_input_text` scans every non-assistant role (whitelist to system/user/tool per design); `upstream_provider` audit field is hardcoded to "openai"; upstream timeout hardcoded at 120 s.
