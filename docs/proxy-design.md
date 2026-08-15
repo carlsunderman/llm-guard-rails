@@ -255,7 +255,7 @@ Org-wide (future):
 
 ## Known issues (from 2026-08-14 review)
 
-- **[P0, resolved 31a8186]** The proxy now forwards the raw request body verbatim (minus `agent_id`/`user_id`), so `tools`, `tool_choice`, `stream`, `response_format`, etc. reach upstream untouched. Covered by `proxy/test_app.py`.
+- **[P0, resolved 31a8186]** The proxy now forwards the raw request body verbatim (minus `agent_id`/`user_id`), so `tools`, `tool_choice`, `stream`, `response_format`, etc. reach upstream untouched. `messages` are re-serialized and redacted in place when the guardrail check returns a `redact` decision (section 8); otherwise byte-equivalent. Covered by `proxy/test_app.py`.
 - **[P1, resolved]** The output block list is now high-confidence only (SSN, grouped credit cards, API-key/token shapes). Email/phone/IPv4 moved to `redact_candidate_patterns` and are redacted in place (section 8).
 - **[P1, resolved]** `proxy/test_app.py` covers field forwarding, model default, null-content/tool_calls verbatim forwarding, input block, output block, fail-closed 503, fail-open passthrough, and allow-path passthrough (mocked upstream + guardrails).
 - **[P3]** `build_input_segments` scans every non-assistant role (whitelist to system/user/tool per design); `upstream_provider` audit field is hardcoded to "openai"; upstream timeout hardcoded at 120 s.
