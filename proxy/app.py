@@ -23,12 +23,12 @@ import os
 import sys
 import time
 import uuid
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Set, Tuple
 from urllib.parse import urlparse
 
 import httpx
 from fastapi import FastAPI, HTTPException, Request
-from fastapi.responses import StreamingResponse
+from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import BaseModel, ValidationError
 
 app = FastAPI(title="LLM Guardrail Proxy", version="0.1.0")
@@ -128,6 +128,26 @@ def write_audit_log(
     print(json.dumps(log.model_dump()), flush=True)
 
 
+def _format_issues(issues: List[Dict[str, Any]]) -> str:
+    """One-line human-readable summary of guardrail issues."""
+    if not issues:
+        return "unspecified"
+    return "; ".join(
+        f"{i.get('scanner', 'unknown')} ({i.get('severity', '?')}): {i.get('message', '')}"
+        for i in issues
+    )
+
+
+def _client_error(status_code: int, message: str, err_type: str) -> JSONResponse:
+    """Error response in the OpenAI error envelope so OpenAI-SDK clients
+    (pi, SDK wrappers, etc.) render the reason instead of an opaque
+    "N status code (no body)"."""
+    return JSONResponse(
+        status_code=status_code,
+        content={"error": {"message": message, "type": err_type, "code": status_code}},
+    )
+
+
 async def call_guardrails_check(
     text: str,
     endpoint: str,
@@ -185,25 +205,58 @@ def message_text(content: Any) -> str:
 # response; other roles are not scanned.
 SCANNED_INPUT_ROLES = ("system", "user", "tool")
 
+# Placeholder replacing a history message flagged by the injection scanner,
+# so a previously blocked injection attempt in context can never reach the
+# model as raw text on later turns (see build_input_segments).
+HISTORY_INJECTION_PLACEHOLDER = "[MESSAGE REDACTED: prompt injection]"
 
-def build_input_segments(messages: List[Dict[str, Any]]) -> tuple:
+
+def build_input_segments(
+    messages: List[Dict[str, Any]]
+) -> Tuple[List[str], List[int], Set[int]]:
     """Build the per-message segments to input-scan.
 
-    Returns (segments, targets): segments are the non-empty texts of
-    system/user/tool messages only (assistant turns are covered by the
-    output check on the final response), targets the parallel message
-    indices so redacted segments can be substituted back in place.
+    Returns (segments, targets, history_positions): segments are the
+    non-empty texts of system/user/tool messages only (assistant turns are
+    covered by the output check on the final response), targets the
+    parallel message indices so redacted segments can be substituted back
+    in place, and history_positions the positions (into segments) of
+    HISTORY messages: user messages before the last non-empty user message,
+    and tool messages at or before the last assistant message. History
+    messages are redacted (not blocked) on detection so a previously
+    blocked injection cannot poison the whole session; the current turn
+    (last user message, post-assistant tool results, system) still blocks.
     """
+    last_assistant = max(
+        (i for i, m in enumerate(messages) if m.get("role") == "assistant"),
+        default=-1,
+    )
+    last_user = max(
+        (
+            i
+            for i, m in enumerate(messages)
+            if m.get("role") == "user" and message_text(m.get("content")).strip()
+        ),
+        default=-1,
+    )
     segments: List[str] = []
     targets: List[int] = []
+    history_positions: Set[int] = set()
     for idx, m in enumerate(messages):
-        if m.get("role") not in SCANNED_INPUT_ROLES:
+        role = m.get("role")
+        if role not in SCANNED_INPUT_ROLES:
             continue
         text = message_text(m.get("content"))
-        if text.strip():
-            segments.append(text)
-            targets.append(idx)
-    return segments, targets
+        if not text.strip():
+            continue
+        position = len(segments)
+        segments.append(text)
+        targets.append(idx)
+        if (role == "user" and idx < last_user) or (
+            role == "tool" and idx <= last_assistant
+        ):
+            history_positions.add(position)
+    return segments, targets, history_positions
 
 
 def _is_all_text_parts(content: Any) -> bool:
@@ -359,12 +412,14 @@ async def chat_completions(request: Request):
     try:
         raw = await request.json()
     except Exception:
-        raise HTTPException(status_code=400, detail="Request body must be valid JSON")
+        return _client_error(400, "Request body must be valid JSON", "invalid_request_error")
 
     try:
         req = ChatCompletionRequest(**raw)
     except ValidationError:
-        raise HTTPException(status_code=422, detail="Invalid request: 'messages' must be a list")
+        return _client_error(
+            422, "Invalid request: 'messages' must be a list", "invalid_request_error"
+        )
 
     request_id = str(uuid.uuid4())
     start_time = time.time()
@@ -374,7 +429,7 @@ async def chat_completions(request: Request):
     user_id = req.user_id
 
     # Step 1: Check input via guardrails
-    input_segments, input_targets = build_input_segments(req.messages)
+    input_segments, input_targets, input_history = build_input_segments(req.messages)
     try:
         input_result = await call_guardrails_check(
             text="\n".join(input_segments),
@@ -383,47 +438,76 @@ async def chat_completions(request: Request):
             user_id=user_id,
             segments=input_segments,
         )
-    except HTTPException:
-        raise
+    except HTTPException as e:
+        return _client_error(503, str(e.detail), "guardrails_unavailable")
     except Exception:
         logger.exception("Unexpected guardrail input check failure")
         if FAIL_CLOSED:
-            raise HTTPException(status_code=503, detail="Guardrail check failed (fail-closed); request blocked.")
+            return _client_error(
+                503, "Guardrail check failed (fail-closed); request blocked.", "guardrails_unavailable"
+            )
         input_result = {"ok": True, "issues": []}
 
     input_decision = "allow" if input_result.get("ok") else "block"
     input_issues = input_result.get("issues", [])
 
+    history_mask_positions: Set[int] = set()
     if not input_result.get("ok"):
-        # Block the request
-        write_audit_log(
-            request_id=request_id,
-            agent_id=agent_id,
-            user_id=user_id,
-            input_decision=input_decision,
-            input_issues=input_issues,
-            output_decision="skip",
-            output_issues=[],
-            overall_decision="block",
-            start_time=start_time,
+        block_issues = [i for i in input_issues if i.get("action") == "block"]
+        # Injection hits carry a segment index; credential/canary hits run
+        # on the joined text and are unattributable (segment=None).
+        attributed = [i for i in block_issues if i.get("segment") is not None]
+        history_only = bool(block_issues) and len(attributed) == len(block_issues) and all(
+            i["segment"] in input_history for i in attributed
         )
-        raise HTTPException(
-            status_code=400,
-            detail=f"Request blocked by guardrails. Issues: {input_issues}",
-        )
+        if not history_only:
+            # Block the request: current-turn hit or unattributable hit
+            write_audit_log(
+                request_id=request_id,
+                agent_id=agent_id,
+                user_id=user_id,
+                input_decision=input_decision,
+                input_issues=input_issues,
+                output_decision="skip",
+                output_issues=[],
+                overall_decision="block",
+                start_time=start_time,
+            )
+            return _client_error(
+                400,
+                f"Request blocked by guardrails: {_format_issues(input_issues)}",
+                "guardrails_block",
+            )
+        # Block hits confined to history messages: mask those messages and
+        # proceed, so a previously blocked injection does not poison the
+        # whole session (the model never sees the raw text in any request).
+        history_mask_positions = {i["segment"] for i in attributed}
+        input_decision = "redact"
+        input_issues = input_issues + [
+            {
+                "scanner": "prompt_injection",
+                "severity": "medium",
+                "message": f"Prompt injection in {len(attributed)} history message(s) redacted instead of blocked",
+                "action": "redact",
+            }
+        ]
 
-    # Redact-action issues: mask low-confidence PII in the input before it
-    # reaches the model (the model then operates on [REDACTED] placeholders).
+    # Apply input redaction to the messages forwarded upstream:
+    # (1) history messages flagged by the injection scanner are replaced
+    #     wholesale with a placeholder (the classifier yields no span),
+    # (2) low-confidence PII is masked in place ([REDACTED] placeholders).
     upstream_messages = req.messages
-    redacted_in = input_result.get("redacted")
-    if redacted_in:
-        redact_notes: List[Dict[str, Any]] = []
+    redact_notes: List[Dict[str, Any]] = []
+    final_segments = list(input_result.get("redacted") or input_segments)
+    for p in history_mask_positions:
+        final_segments[p] = HISTORY_INJECTION_PLACEHOLDER
+    if final_segments != input_segments:
         upstream_messages = substitute_input_redaction(
-            req.messages, input_targets, input_segments, redacted_in, redact_notes
+            req.messages, input_targets, input_segments, final_segments, redact_notes
         )
         if redact_notes:
             input_issues = input_issues + redact_notes
-        if any(r != s for r, s in zip(redacted_in, input_segments)):
+        if input_decision == "allow":
             input_decision = "redact"
 
     # Step 2: Forward to upstream LLM provider.
@@ -464,9 +548,10 @@ async def chat_completions(request: Request):
             overall_decision="error",
             start_time=start_time,
         )
-        raise HTTPException(
-            status_code=502,
-            detail=f"Upstream LLM error (upstream status {e.response.status_code})",
+        return _client_error(
+            502,
+            f"Upstream LLM error (upstream status {e.response.status_code})",
+            "upstream_error",
         )
     except Exception:
         logger.exception("Upstream LLM call failed (model=%s)", model)
@@ -481,7 +566,7 @@ async def chat_completions(request: Request):
             overall_decision="error",
             start_time=start_time,
         )
-        raise HTTPException(status_code=502, detail="Upstream LLM error")
+        return _client_error(502, "Upstream LLM error", "upstream_error")
 
     # Step 3: Check output via guardrails
     output_segments, output_has_content = build_output_segments(response_data)
@@ -493,12 +578,16 @@ async def chat_completions(request: Request):
             user_id=user_id,
             segments=output_segments,
         )
-    except HTTPException:
-        raise
+    except HTTPException as e:
+        return _client_error(503, str(e.detail), "guardrails_unavailable")
     except Exception:
         logger.exception("Unexpected guardrail output check failure")
         if FAIL_CLOSED:
-            raise HTTPException(status_code=503, detail="Guardrail check failed on output (fail-closed); response blocked.")
+            return _client_error(
+                503,
+                "Guardrail check failed on output (fail-closed); response blocked.",
+                "guardrails_unavailable",
+            )
         output_result = {"ok": True, "issues": []}
 
     output_decision = "allow" if output_result.get("ok") else "block"
@@ -517,9 +606,10 @@ async def chat_completions(request: Request):
             overall_decision="block",
             start_time=start_time,
         )
-        raise HTTPException(
-            status_code=400,
-            detail=f"Response blocked by guardrails. Issues: {output_issues}",
+        return _client_error(
+            400,
+            f"Response blocked by guardrails: {_format_issues(output_issues)}",
+            "guardrails_block",
         )
 
     # Redact-action issues: mask low-confidence PII in the assistant content

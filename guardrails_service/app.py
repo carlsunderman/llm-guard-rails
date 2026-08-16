@@ -15,9 +15,12 @@ block (fail the request), redact (mask + pass), or allow (log + pass).
 Run via Docker Compose; exposes HTTP endpoints on port 8090.
 """
 
+import concurrent.futures
 import os
 import re
-from typing import List, Literal, Optional
+import threading
+import unicodedata
+from typing import List, Literal, Optional, Tuple
 
 from fastapi import FastAPI
 from pydantic import BaseModel
@@ -151,6 +154,9 @@ class Issue(BaseModel):
     message: str
     # Enforcement action applied to this issue, from SCANNER_POLICY.
     action: ScannerAction = "block"
+    # Index into the request's segments list when the issue is attributable
+    # to a single segment; None for scanners that run on the joined text.
+    segment: Optional[int] = None
 
 
 def _is_placeholder(value: str) -> bool:
@@ -171,7 +177,16 @@ def _load_canary_tokens() -> List[str]:
 
 
 def run_credential_scanners(text: str) -> List[Issue]:
-    """Regex-based credential leak detection. Never echoes matched values."""
+    """Regex-based credential leak detection. Never echoes matched values.
+
+    Scans an NFKC-normalized copy: NFKC folds compatibility lookalikes
+    (fullwidth letters/digits, ligatures, ...) to canonical ASCII, so
+    patterns cannot be evaded by homoglyph-style substitution. Detection
+    only — the normalized copy is never returned, audited, or forwarded.
+    The PII redaction scanners intentionally keep the original text: their
+    redacted output is forwarded upstream and must not be rewritten.
+    """
+    text = unicodedata.normalize("NFKC", text)
     issues: List[Issue] = []
     seen: set = set()
     for name, pattern in CREDENTIAL_PATTERNS:
@@ -190,7 +205,9 @@ def run_credential_scanners(text: str) -> List[Issue]:
                 )
             )
     for token in _load_canary_tokens():
-        if token in text:
+        # The canary is matched against the NFKC copy, so fold the token
+        # too (e.g. a fullwidth-pasted CANARY_TOKENS env value).
+        if unicodedata.normalize("NFKC", token) in text:
             issues.append(
                 Issue(
                     scanner="canary_token",
@@ -288,22 +305,45 @@ def run_invisible_text_sanitization(segments: List[str]) -> tuple:
     return (redacted if hits else None), issues
 
 
-def run_input_scanners(text: str) -> List[Issue]:
-    """Run input scanners using llm-guard 0.3.x API: scan(prompt) -> (text, is_valid, score)."""
+def run_input_scanners(segments: List[str]) -> List[Issue]:
+    """Run input scanners using llm-guard 0.3.x API: scan(prompt) -> (text, is_valid, score).
+
+    The injection classifier runs per segment (message), not on the joined
+    text: a legitimate-looking system prompt in context suppresses its score
+    for a malicious user message (see test_check_input_injection_after_system_prompt).
+    Segments are scanned concurrently and EVERY offending segment is
+    reported with its caller-side index (Issue.segment), so the caller can
+    attribute each hit to a specific message.
+    """
+    indexed: List[Tuple[int, str]] = [(i, s) for i, s in enumerate(segments) if s.strip()]
+    if not indexed:
+        return []
+
+    lock = threading.Lock()
     issues: List[Issue] = []
 
-    # Prompt injection
-    _, is_valid, score = prompt_injection_scanner.scan(text)
-    if not is_valid:
-        severity = "critical" if score > 0.9 else "high"
-        issues.append(
-            Issue(
-                scanner="prompt_injection",
-                severity=severity,
-                message=f"Possible prompt injection detected (score={score:.2f})",
-                action=SCANNER_POLICY["prompt_injection"],
+    def scan_segment(item: Tuple[int, str]) -> None:
+        idx, segment = item
+        # Prompt injection
+        _, is_valid, score = prompt_injection_scanner.scan(segment)
+        if is_valid:
+            return
+        with lock:
+            severity = "critical" if score > 0.9 else "high"
+            issues.append(
+                Issue(
+                    scanner="prompt_injection",
+                    severity=severity,
+                    message=f"Possible prompt injection detected (score={score:.2f})",
+                    action=SCANNER_POLICY["prompt_injection"],
+                    segment=idx,
+                )
             )
-        )
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=min(4, len(indexed))) as pool:
+        futures = [pool.submit(scan_segment, it) for it in indexed]
+        for f in futures:
+            f.result()
 
     return issues
 
@@ -345,7 +385,7 @@ def check_input(req: CheckRequest):
     if not text.strip():
         return CheckResponse(ok=True)
 
-    issues = run_input_scanners(text) + run_credential_scanners(text)
+    issues = run_input_scanners(segments) + run_credential_scanners(text)
     redacted, pii_issues = run_pii_redaction(segments)
     # Invisible-text sanitization runs on top of the PII-redacted text; when
     # it changes anything its output already includes the PII redaction.
