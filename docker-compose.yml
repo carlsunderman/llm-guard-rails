@@ -30,7 +30,9 @@ services:
     container_name: agent-guardrails-proxy
     ports:
       # Loopback only: unauthenticated proxy holding an upstream API key.
-      - "127.0.0.1:8000:8000"
+      # Host port configurable via PROXY_HOST_PORT (default 8000; override in
+      # .env if another local service owns 8000).
+      - "127.0.0.1:${PROXY_HOST_PORT:-8000}:8000"
     environment:
       - HOST=0.0.0.0
       - PORT=8000

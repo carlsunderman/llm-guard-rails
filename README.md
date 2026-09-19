@@ -27,7 +27,7 @@ See `docs/proxy-design.md` for architecture and design decisions.
   - Fail-closed by default if guardrails are unreachable.
   - Refuses to start if UPSTREAM_API_KEY is not set.
   - Structured JSON-line audit logging to a pure-JSON stdout (access logs disabled).
-  - Port: 8000
+  - Port: 8000 (loopback only; host port overridable via `PROXY_HOST_PORT`)
 
 ## Prerequisites (host)
 
@@ -153,7 +153,7 @@ Audit lines for each decision are visible via `docker logs agent-guardrails-prox
 
 ## Client integrations
 
-Point each tool at `http://localhost:8000/v1`. The proxy is OpenAI Chat Completions-compatible (non-streaming and streaming; streaming responses are buffered, checked, then replayed as SSE).
+Point each tool at `http://localhost:8000/v1` (or `http://localhost:$PROXY_HOST_PORT/v1` if you overrode the host port in `.env`). The proxy is OpenAI Chat Completions-compatible (non-streaming and streaming; streaming responses are buffered, checked, then replayed as SSE).
 
 ### Pi (and other pi-based tools)
 
