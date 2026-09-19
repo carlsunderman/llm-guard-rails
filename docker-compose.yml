@@ -11,6 +11,10 @@ services:
       - PORT=8090
       # Comma-separated exact-match canary tokens to detect in inputs/outputs
       - CANARY_TOKENS=${CANARY_TOKENS:-}
+      # Needle 3 triage classifier (audit-only); weights baked at build time.
+      # DEFAULT OFF: zero-shot precision failed evaluation (D-13); enable only
+      # with fine-tuned weights or for further live evaluation.
+      - NEEDLE_ENABLED=${NEEDLE_ENABLED:-false}
     restart: unless-stopped
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:8090/health"]
