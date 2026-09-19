@@ -273,17 +273,28 @@ def substitute_input_redaction(
     segments: List[str],
     redacted: List[str],
     notes: List[Dict[str, Any]],
+    force_mask_targets: Optional[Set[int]] = None,
 ) -> List[Dict[str, Any]]:
     """Copy `messages` with redacted segment text substituted in place.
 
     Substitution rules: string content is replaced; an all-text-part content
     list is replaced by a single text part carrying the redacted text; a
     list containing non-text parts (images, etc.) is left untouched and
-    recorded in `notes` for the audit log.
+    recorded in `notes` for the audit log — except for targets in
+    `force_mask_targets` (history injection masks), which are replaced
+    wholesale regardless of part shape so a flagged injection never reaches
+    the model as raw text (see build_input_segments / D-11).
     """
     new_messages = [dict(m) for m in messages]
+    force_mask_targets = force_mask_targets or set()
     for msg_idx, original, red in zip(targets, segments, redacted):
         if red == original:
+            continue
+        if msg_idx in force_mask_targets:
+            # History injection mask: replace the entire content, including
+            # non-text parts — the injection classifier saw the flattened
+            # text of this message, so the whole message is untrusted.
+            new_messages[msg_idx]["content"] = red
             continue
         content = new_messages[msg_idx].get("content")
         if isinstance(content, str):
@@ -302,7 +313,7 @@ def substitute_input_redaction(
     return new_messages
 
 
-def build_output_segments(response_data: Dict[str, Any]) -> tuple:
+def build_output_segments(response_data: Dict[str, Any]) -> Tuple[List[str], bool]:
     """Build the per-part segments to output-scan from the upstream response.
 
     Returns (segments, has_content): the assistant content string (if any)
@@ -439,10 +450,32 @@ async def chat_completions(request: Request):
             segments=input_segments,
         )
     except HTTPException as e:
+        write_audit_log(
+            request_id=request_id,
+            agent_id=agent_id,
+            user_id=user_id,
+            input_decision="error",
+            input_issues=[],
+            output_decision="skip",
+            output_issues=[],
+            overall_decision="error",
+            start_time=start_time,
+        )
         return _client_error(503, str(e.detail), "guardrails_unavailable")
     except Exception:
         logger.exception("Unexpected guardrail input check failure")
         if FAIL_CLOSED:
+            write_audit_log(
+                request_id=request_id,
+                agent_id=agent_id,
+                user_id=user_id,
+                input_decision="error",
+                input_issues=[],
+                output_decision="skip",
+                output_issues=[],
+                overall_decision="error",
+                start_time=start_time,
+            )
             return _client_error(
                 503, "Guardrail check failed (fail-closed); request blocked.", "guardrails_unavailable"
             )
@@ -503,7 +536,12 @@ async def chat_completions(request: Request):
         final_segments[p] = HISTORY_INJECTION_PLACEHOLDER
     if final_segments != input_segments:
         upstream_messages = substitute_input_redaction(
-            req.messages, input_targets, input_segments, final_segments, redact_notes
+            req.messages,
+            input_targets,
+            input_segments,
+            final_segments,
+            redact_notes,
+            force_mask_targets={input_targets[p] for p in history_mask_positions},
         )
         if redact_notes:
             input_issues = input_issues + redact_notes
@@ -520,6 +558,9 @@ async def chat_completions(request: Request):
     # response before anything reaches the client. Streaming clients get the
     # checked response replayed as SSE (see build_sse_events).
     upstream_body["stream"] = False
+    # stream_options is invalid without stream: true; strip it so streaming
+    # clients asking for usage chunks do not trip an upstream 400.
+    upstream_body.pop("stream_options", None)
 
     try:
         async with httpx.AsyncClient(timeout=UPSTREAM_TIMEOUT) as client:
@@ -579,10 +620,32 @@ async def chat_completions(request: Request):
             segments=output_segments,
         )
     except HTTPException as e:
+        write_audit_log(
+            request_id=request_id,
+            agent_id=agent_id,
+            user_id=user_id,
+            input_decision=input_decision,
+            input_issues=input_issues,
+            output_decision="error",
+            output_issues=[],
+            overall_decision="error",
+            start_time=start_time,
+        )
         return _client_error(503, str(e.detail), "guardrails_unavailable")
     except Exception:
         logger.exception("Unexpected guardrail output check failure")
         if FAIL_CLOSED:
+            write_audit_log(
+                request_id=request_id,
+                agent_id=agent_id,
+                user_id=user_id,
+                input_decision=input_decision,
+                input_issues=input_issues,
+                output_decision="error",
+                output_issues=[],
+                overall_decision="error",
+                start_time=start_time,
+            )
             return _client_error(
                 503,
                 "Guardrail check failed on output (fail-closed); response blocked.",
