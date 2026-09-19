@@ -8,6 +8,9 @@ Uses LLM Guard (v0.3.16) to scan prompts and responses for:
   private keys, password assignments, canary tokens) in inputs and outputs
 - Low-confidence PII (emails, IPv4, phone numbers) in inputs and outputs —
   redacted to [REDACTED] in the `redacted` response field, never blocking
+- Optional Needle 3 local triage classifier (audit-only, action "allow"):
+  labels segments benign/instruction_override/exfiltration; requires the
+  cactus-needle package + baked weights, self-disables otherwise
 
 Each scanner maps to an enforcement action via SCANNER_POLICY:
 block (fail the request), redact (mask + pass), or allow (log + pass).
@@ -20,7 +23,7 @@ import os
 import re
 import threading
 import unicodedata
-from typing import List, Literal, Optional, Tuple
+from typing import Any, Dict, List, Literal, Optional, Tuple
 
 from fastapi import FastAPI
 from pydantic import BaseModel
@@ -28,6 +31,27 @@ from pydantic import BaseModel
 # LLM Guard imports (loaded once at startup in container)
 from llm_guard.input_scanners import InvisibleText, PromptInjection
 from llm_guard.output_scanners import Regex as OutputRegex
+
+# Needle 3 (cactus-needle): local triage classifier. Optional at import so
+# the image still builds/runs without it; the scanner self-disables when the
+# engine or weights are unavailable (audit-only, action "allow", D-13).
+try:
+    import needle as _needle
+
+    class _TriageVerdict(BaseModel):
+        verdict: Literal[
+            "benign", "instruction_override", "exfiltration", "unclear"
+        ]
+
+    def _needle_extract(text: str) -> Any:
+        return _needle.extract(text, _TriageVerdict)
+
+    _NEEDLE_AVAILABLE = True
+except Exception:  # pragma: no cover - depends on image build args
+    _NEEDLE_AVAILABLE = False
+
+    def _needle_extract(text: str) -> Any:
+        return None
 
 app = FastAPI(title="Agent Guardrails", version="0.1.0")
 
@@ -97,13 +121,14 @@ pii_redaction_scanners = [
 #   allow  -> logged to the audit trail only; pass
 # Change a value here and restart the service to flip behavior.
 ScannerAction = Literal["block", "redact", "allow"]
-SCANNER_POLICY: dict = {
+SCANNER_POLICY: Dict[str, ScannerAction] = {
     "prompt_injection": "block",
     "credentials": "block",
     "canary_token": "block",
     "sensitive_patterns": "block",
     "pii": "redact",
     "invisible_text": "redact",
+    "needle_triage": "allow",
 }
 
 # Credential-leak scanner (regex, no ML). Runs on BOTH inputs and outputs:
@@ -112,7 +137,7 @@ SCANNER_POLICY: dict = {
 # Covers AWS, GitHub, JWTs, PEM private keys, generic connection strings
 # with embedded user:pass (mongodb, postgres, mssql, hana/SAP, redis, ...),
 # and named secret assignments (password=..., secret: ...).
-CREDENTIAL_PATTERNS: List[tuple] = [
+CREDENTIAL_PATTERNS: List[Tuple[str, str]] = [
     ("aws_access_key_id", r"\bAKIA[0-9A-Z]{16}\b"),
     ("aws_temp_access_key_id", r"\bASIA[0-9A-Z]{16}\b"),
     ("github_token", r"\bgh[opsur]_[A-Za-z0-9]{36,}\b"),
@@ -146,6 +171,10 @@ PLACEHOLDER_VALUES = {
     "xxxx", "dummy", "test", "password", "passwd", "secret", "token",
     "todo", "fixme", "redacted",
 }
+
+
+# Lock serializing Needle engine access across scan threads.
+_needle_lock = threading.Lock()
 
 
 class Issue(BaseModel):
@@ -244,7 +273,7 @@ def _effective_segments(req: CheckRequest) -> List[str]:
     return req.segments if req.segments is not None else [req.text]
 
 
-def run_pii_redaction(segments: List[str]) -> tuple:
+def run_pii_redaction(segments: List[str]) -> Tuple[Optional[List[str]], List[Issue]]:
     """Run the redact-mode PII scanner per segment.
 
     The redact patterns never span newlines, so per-segment redaction is
@@ -276,7 +305,7 @@ def run_pii_redaction(segments: List[str]) -> tuple:
     return (redacted if hits else None), issues
 
 
-def run_invisible_text_sanitization(segments: List[str]) -> tuple:
+def run_invisible_text_sanitization(segments: List[str]) -> Tuple[Optional[List[str]], List[Issue]]:
     """Strip invisible characters per segment (input path only).
 
     Like run_pii_redaction, returns (redacted_segments_or_None, issues):
@@ -348,6 +377,45 @@ def run_input_scanners(segments: List[str]) -> List[Issue]:
     return issues
 
 
+def run_needle_triage(segments: List[str]) -> List[Issue]:
+    """Needle 3 local triage classifier, one call per segment (D-13).
+
+    Audit-only signal: SCANNER_POLICY["needle_triage"] is "allow", so a
+    suspicious verdict never fails the request — it exists to give the
+    operators an independent, calibrated signal alongside the DeBERTa
+    injection scanner (see active issue I-02) and to gate future promotion.
+    Serialized under a module lock: the Needle engine instance is not
+    documented thread-safe (same caveat as the shared PromptInjection
+    scanner). Any engine failure yields no issue (silent skip) — an
+    audit-only signal must never break the request path.
+    """
+    if os.getenv("NEEDLE_ENABLED", "true").lower() not in ("true", "1", "yes"):
+        return []
+    if not _NEEDLE_AVAILABLE or not segments:
+        return []
+    issues: List[Issue] = []
+    with _needle_lock:
+        for idx, segment in enumerate(segments):
+            try:
+                verdict = _needle_extract(segment)
+            except Exception:
+                continue
+            if verdict is None:
+                continue
+            v = getattr(verdict, "verdict", None)
+            if v in ("instruction_override", "exfiltration"):
+                issues.append(
+                    Issue(
+                        scanner="needle_triage",
+                        severity="medium",
+                        message=f"Needle triage: {v}",
+                        action=SCANNER_POLICY["needle_triage"],
+                        segment=idx,
+                    )
+                )
+    return issues
+
+
 def run_output_scanners(prompt_text: str, output_text: str) -> List[Issue]:
     """Run output scanners using llm-guard 0.3.x API: scan(prompt, output) -> (text, is_valid, score)."""
     issues: List[Issue] = []
@@ -385,16 +453,29 @@ def check_input(req: CheckRequest):
     if not text.strip():
         return CheckResponse(ok=True)
 
-    issues = run_input_scanners(segments) + run_credential_scanners(text)
-    redacted, pii_issues = run_pii_redaction(segments)
-    # Invisible-text sanitization runs on top of the PII-redacted text; when
-    # it changes anything its output already includes the PII redaction.
-    sanitized, invisible_issues = run_invisible_text_sanitization(
-        redacted or segments
+    issues: List[Issue] = []
+    # Invisible-text sanitization first: strips zero-width/bidi characters so
+    # evasion-split payloads are reassembled before any classifier sees them.
+    stripped, invisible_issues = run_invisible_text_sanitization(segments)
+    issues = issues + invisible_issues
+    # Injection classifier + credential regexes run on the stripped text
+    # (pre-PII-redaction): the DeBERTa classifier scores the literal
+    # "[REDACTED]" marker at 1.00, so it must judge the user's actual text.
+    scan_segments = stripped or segments
+    issues = (
+        issues
+        + run_input_scanners(scan_segments)
+        + run_credential_scanners("\n".join(scan_segments))
+        + run_needle_triage(scan_segments)
     )
-    issues = issues + pii_issues + invisible_issues
+    # PII redaction last: its output is the text forwarded upstream. When no
+    # PII was masked, the stripped text is the forwarded copy.
+    redacted, pii_issues = run_pii_redaction(scan_segments)
+    issues = issues + pii_issues
     return CheckResponse(
-        ok=_decide(issues), issues=issues, redacted=sanitized or redacted
+        ok=_decide(issues),
+        issues=issues,
+        redacted=redacted if redacted is not None else stripped,
     )
 
 
@@ -411,10 +492,21 @@ def check_output(req: CheckRequest):
     if not text.strip():
         return CheckResponse(ok=True)
 
-    issues = run_output_scanners("", text) + run_credential_scanners(text)
-    redacted, pii_issues = run_pii_redaction(segments)
+    stripped, invisible_issues = run_invisible_text_sanitization(segments)
+    scan_text = "\n".join(stripped or segments)
+    issues = (
+        run_output_scanners("", scan_text)
+        + run_credential_scanners(scan_text)
+        + invisible_issues
+    )
+    # PII redaction last: its output is the text forwarded to the client.
+    redacted, pii_issues = run_pii_redaction(stripped or segments)
     issues = issues + pii_issues
-    return CheckResponse(ok=_decide(issues), issues=issues, redacted=redacted)
+    return CheckResponse(
+        ok=_decide(issues),
+        issues=issues,
+        redacted=redacted if redacted is not None else stripped,
+    )
 
 
 if __name__ == "__main__":
