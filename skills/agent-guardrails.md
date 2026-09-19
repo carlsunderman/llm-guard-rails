@@ -53,7 +53,8 @@ Response handling:
 Two-layer model:
 - Soft layer (this skill): the agent scans risky content via the endpoints above.
 - Hard layer (proxy): tools configured with the guardrail proxy base URL
-  (http://localhost:8000) are checked automatically on every LLM call,
+  (http://localhost:8000, or the `PROXY_HOST_PORT` override in `.env`)
+  are checked automatically on every LLM call,
   so no agent action is required. This skill still helps for content that
   does not pass through the proxy.
 
