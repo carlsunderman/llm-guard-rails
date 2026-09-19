@@ -79,7 +79,7 @@ Format (one JSON object per line to stdout):
 }
 
 Decision enums (as implemented):
-- input_decision: allow | redact (PII masked in the request before the upstream call) | block
+- input_decision: allow | redact (PII masked in the request before the upstream call) | block | error (guardrail check unavailable/failed)
 - output_decision: allow | redact (PII masked in the response before the client) | block | skip (skipped when the input was already blocked) | error (upstream call failed)
 - overall_decision: allow | block | error (redacted requests still count as allow)
 

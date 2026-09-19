@@ -5,7 +5,8 @@ services:
       dockerfile: Dockerfile
     container_name: agent-guardrails
     ports:
-      - "8090:8090"
+      # Loopback only: unauthenticated service; expose to the LAN deliberately.
+      - "127.0.0.1:8090:8090"
     environment:
       - HOST=0.0.0.0
       - PORT=8090
@@ -28,7 +29,8 @@ services:
       dockerfile: Dockerfile
     container_name: agent-guardrails-proxy
     ports:
-      - "8000:8000"
+      # Loopback only: unauthenticated proxy holding an upstream API key.
+      - "127.0.0.1:8000:8000"
     environment:
       - HOST=0.0.0.0
       - PORT=8000

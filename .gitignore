@@ -24,3 +24,15 @@ AGENTS.md
 docs/review-2026-08-14.md
 # Potential enhancements / improvements - local scratch, never commit
 docs/enhancements.md
+
+# Stray user dotfiles / local tooling in the repo root — never commit
+.bash_profile
+.bashrc
+.gitconfig
+.mcp.json
+.profile
+.ripgreprc
+.zprofile
+.zshrc
+.mailmap
+.pi/
